@@ -92,9 +92,10 @@ var basicConfig = &Config{
 		HostVolumes: []*structs.ClientHostVolumeConfig{
 			{Name: "tmp", Path: "/tmp"},
 		},
-		CNIPath:             "/tmp/cni_path",
-		BridgeNetworkName:   "custom_bridge_name",
-		BridgeNetworkSubnet: "custom_bridge_subnet",
+		CNIPath:                 "/tmp/cni_path",
+		BridgeNetworkName:       "custom_bridge_name",
+		BridgeNetworkSubnet:     "custom_bridge_subnet",
+		BridgeNetworkSubnetIPv6: "custom_bridge_subnet_ipv6",
 	},
 	Server: &ServerConfig{
 		Enabled:                   true,
@@ -282,17 +283,16 @@ var basicConfig = &Config{
 		},
 	}},
 	TLSConfig: &config.TLSConfig{
-		EnableHTTP:                  true,
-		EnableRPC:                   true,
-		VerifyServerHostname:        true,
-		CAFile:                      "foo",
-		CertFile:                    "bar",
-		KeyFile:                     "pipe",
-		RPCUpgradeMode:              true,
-		VerifyHTTPSClient:           true,
-		TLSPreferServerCipherSuites: true,
-		TLSCipherSuites:             "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
-		TLSMinVersion:               "tls12",
+		EnableHTTP:           true,
+		EnableRPC:            true,
+		VerifyServerHostname: true,
+		CAFile:               "foo",
+		CertFile:             "bar",
+		KeyFile:              "pipe",
+		RPCUpgradeMode:       true,
+		VerifyHTTPSClient:    true,
+		TLSCipherSuites:      "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+		TLSMinVersion:        "tls12",
 	},
 	HTTPAPIResponseHeaders: map[string]string{
 		"Access-Control-Allow-Origin": "*",
@@ -344,6 +344,9 @@ var basicConfig = &Config{
 		},
 	},
 	Reporting: &config.ReportingConfig{
+		ExportAddress:     "http://localhost:8080",
+		ExportIntervalHCL: "15m",
+		ExportInterval:    time.Minute * 15,
 		License: &config.LicenseReportingConfig{
 			Enabled: pointer.Of(true),
 		},
@@ -427,7 +430,7 @@ var pluginConfig = &Config{
 		},
 	},
 	Reporting: &config.ReportingConfig{
-		&config.LicenseReportingConfig{},
+		License: &config.LicenseReportingConfig{},
 	},
 	Consuls: []*config.ConsulConfig{},
 	Vaults:  []*config.VaultConfig{},
@@ -482,7 +485,7 @@ var nonoptConfig = &Config{
 	HTTPAPIResponseHeaders:    map[string]string{},
 	Sentinel:                  nil,
 	Reporting: &config.ReportingConfig{
-		&config.LicenseReportingConfig{},
+		License: &config.LicenseReportingConfig{},
 	},
 	Consuls: []*config.ConsulConfig{},
 	Vaults:  []*config.VaultConfig{},
@@ -563,7 +566,6 @@ func TestConfig_Parse(t *testing.T) {
 			}
 			actual = oldDefault.Merge(actual)
 
-			must.Eq(t, tc.Result.KEKProviders, actual.KEKProviders)
 			must.Eq(t, tc.Result, removeHelperAttributes(actual))
 		})
 	}
@@ -615,7 +617,7 @@ func (c *Config) addDefaults() {
 	}
 	if c.Reporting == nil {
 		c.Reporting = &config.ReportingConfig{
-			&config.LicenseReportingConfig{
+			License: &config.LicenseReportingConfig{
 				Enabled: pointer.Of(false),
 			},
 		}
@@ -893,7 +895,7 @@ var sample1 = &Config{
 		CleanupDeadServers: pointer.Of(true),
 	},
 	Reporting: &config.ReportingConfig{
-		&config.LicenseReportingConfig{},
+		License: &config.LicenseReportingConfig{},
 	},
 	KEKProviders: []*structs.KEKProviderConfig{
 		{
@@ -1143,4 +1145,45 @@ func TestConfig_Telemetry(t *testing.T) {
 	mergedTelemetry2 := mergedTelemetry1.Merge(inputTelemetry2)
 	must.Eq(t, mergedTelemetry2.inMemoryCollectionInterval, 1*time.Second)
 	must.Eq(t, mergedTelemetry2.inMemoryRetentionPeriod, 10*time.Second)
+}
+
+func TestConfig_Template(t *testing.T) {
+	ci.Parallel(t)
+
+	for _, suffix := range []string{"hcl", "json"} {
+		t.Run(suffix, func(t *testing.T) {
+			cfg := DefaultConfig()
+			fc, err := LoadConfig("testdata/template." + suffix)
+			must.NoError(t, err)
+			cfg = cfg.Merge(fc)
+
+			must.Eq(t, []string{"plugin"}, cfg.Client.TemplateConfig.FunctionDenylist)
+			must.True(t, cfg.Client.TemplateConfig.DisableSandbox)
+			must.Eq(t, pointer.Of(7600*time.Hour), cfg.Client.TemplateConfig.MaxStale)
+			must.Eq(t, pointer.Of(10*time.Minute), cfg.Client.TemplateConfig.BlockQueryWaitTime)
+
+			must.NotNil(t, cfg.Client.TemplateConfig.Wait)
+			must.Eq(t, pointer.Of(10*time.Second), cfg.Client.TemplateConfig.Wait.Min)
+			must.Eq(t, pointer.Of(10*time.Minute), cfg.Client.TemplateConfig.Wait.Max)
+
+			must.NotNil(t, cfg.Client.TemplateConfig.WaitBounds)
+			must.Eq(t, pointer.Of(1*time.Second), cfg.Client.TemplateConfig.WaitBounds.Min)
+			must.Eq(t, pointer.Of(10*time.Hour), cfg.Client.TemplateConfig.WaitBounds.Max)
+
+			must.NotNil(t, cfg.Client.TemplateConfig.ConsulRetry)
+			must.Eq(t, 6, *cfg.Client.TemplateConfig.ConsulRetry.Attempts)
+			must.Eq(t, pointer.Of(550*time.Millisecond), cfg.Client.TemplateConfig.ConsulRetry.Backoff)
+			must.Eq(t, pointer.Of(10*time.Minute), cfg.Client.TemplateConfig.ConsulRetry.MaxBackoff)
+
+			must.NotNil(t, cfg.Client.TemplateConfig.VaultRetry)
+			must.Eq(t, 6, *cfg.Client.TemplateConfig.VaultRetry.Attempts)
+			must.Eq(t, pointer.Of(550*time.Millisecond), cfg.Client.TemplateConfig.VaultRetry.Backoff)
+			must.Eq(t, pointer.Of(10*time.Minute), cfg.Client.TemplateConfig.VaultRetry.MaxBackoff)
+
+			must.NotNil(t, cfg.Client.TemplateConfig.NomadRetry)
+			must.Eq(t, 6, *cfg.Client.TemplateConfig.NomadRetry.Attempts)
+			must.Eq(t, pointer.Of(550*time.Millisecond), cfg.Client.TemplateConfig.NomadRetry.Backoff)
+			must.Eq(t, pointer.Of(10*time.Minute), cfg.Client.TemplateConfig.NomadRetry.MaxBackoff)
+		})
+	}
 }

@@ -12,8 +12,6 @@ import (
 	"testing"
 	"time"
 
-	jwt "github.com/go-jose/go-jose/v3/jwt"
-	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/hashicorp/consul/api"
 	"github.com/hashicorp/go-multierror"
 	"github.com/hashicorp/nomad/ci"
@@ -399,6 +397,18 @@ func TestJob_Validate(t *testing.T) {
 				"Task Group web should have an ephemeral disk object",
 			},
 		},
+		{
+			name: "VersionTag Description length",
+			job: &Job{
+				Type: JobTypeService,
+				VersionTag: &JobVersionTag{
+					Description: strings.Repeat("a", 1001),
+				},
+			},
+			expErr: []string{
+				"Tagged version description must be under 1000 characters",
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -754,6 +764,7 @@ func testJob() *Job {
 							},
 						},
 						Identity: &WorkloadIdentity{
+							Name: "foo",
 							Env:  true,
 							File: true,
 						},
@@ -1520,7 +1531,7 @@ func TestTaskGroup_Validate(t *testing.T) {
 			tg: &TaskGroup{
 				Networks: []*NetworkResource{
 					{
-						DynamicPorts: []Port{{"http", 0, 80, ""}},
+						DynamicPorts: []Port{{Label: "http", To: 80}},
 					},
 				},
 				Tasks: []*Task{
@@ -1528,7 +1539,7 @@ func TestTaskGroup_Validate(t *testing.T) {
 						Resources: &Resources{
 							Networks: []*NetworkResource{
 								{
-									DynamicPorts: []Port{{"http", 0, 80, ""}},
+									DynamicPorts: []Port{{Label: "http", To: 80}},
 								},
 							},
 						},
@@ -2067,6 +2078,31 @@ func TestTaskGroupNetwork_Validate(t *testing.T) {
 			},
 			ErrContains: "invalid ';' character in CNI arg value \"first_value;",
 		},
+		{
+			TG: &TaskGroup{
+				Name: "testing-port-ignore-collision-ok",
+				Networks: []*NetworkResource{{
+					Mode: "host",
+					ReservedPorts: []Port{
+						{Label: "one", Value: 10, IgnoreCollision: true},
+						{Label: "two", Value: 10, IgnoreCollision: true},
+					},
+				}},
+			},
+		},
+		{
+			TG: &TaskGroup{
+				Name: "testing-port-ignore-collision-non-host-network-mode",
+				Networks: []*NetworkResource{{
+					Mode: "not-host",
+					ReservedPorts: []Port{
+						{Label: "one", Value: 10, IgnoreCollision: true},
+						{Label: "two", Value: 10, IgnoreCollision: true},
+					},
+				}},
+			},
+			ErrContains: "collision may not be ignored on non-host network mode",
+		},
 	}
 
 	for i := range cases {
@@ -2276,17 +2312,52 @@ func TestTask_Validate_Resources(t *testing.T) {
 				MemoryMaxMB: -1,
 			},
 		},
+		{
+			name: "numa devices do not match",
+			res: &Resources{
+				CPU:      100,
+				MemoryMB: 200,
+				Devices: []*RequestedDevice{
+					{
+						Name:  "evilcorp/gpu",
+						Count: 2,
+					},
+					{
+						Name:  "fpga",
+						Count: 1,
+					},
+					{
+						Name:  "net/nic/model1",
+						Count: 1,
+					},
+				},
+				NUMA: &NUMA{
+					Affinity: "require",
+					Devices:  []string{"evilcorp/gpu", "bad/bad", "fpga"},
+				},
+			},
+			err: "numa device \"bad/bad\" not requested as task resource",
+		},
+		{
+			name: "numa affinity not valid",
+			res: &Resources{
+				CPU:      100,
+				MemoryMB: 200,
+				NUMA: &NUMA{
+					Affinity: "bad",
+				},
+			},
+			err: "numa affinity must be one of none, prefer, or require",
+		},
 	}
 
-	for i := range cases {
-		tc := cases[i]
+	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.res.Validate()
 			if tc.err == "" {
-				require.NoError(t, err)
+				must.NoError(t, err)
 			} else {
-				require.Error(t, err)
-				require.Contains(t, err.Error(), tc.err)
+				must.ErrorContains(t, err, tc.err)
 			}
 		})
 	}
@@ -3772,7 +3843,7 @@ func TestResource_Add(t *testing.T) {
 			{
 				CIDR:          "10.0.0.0/8",
 				MBits:         100,
-				ReservedPorts: []Port{{"ssh", 22, 0, ""}},
+				ReservedPorts: []Port{{Label: "ssh", Value: 22}},
 			},
 		},
 	}
@@ -3785,7 +3856,13 @@ func TestResource_Add(t *testing.T) {
 			{
 				IP:            "10.0.0.1",
 				MBits:         50,
-				ReservedPorts: []Port{{"web", 80, 0, ""}},
+				ReservedPorts: []Port{{Label: "web", Value: 80}},
+			},
+		},
+		Devices: []*RequestedDevice{
+			{
+				Name:  "nvidia/gpu/Tesla M60",
+				Count: 1,
 			},
 		},
 	}
@@ -3802,7 +3879,13 @@ func TestResource_Add(t *testing.T) {
 			{
 				CIDR:          "10.0.0.0/8",
 				MBits:         150,
-				ReservedPorts: []Port{{"ssh", 22, 0, ""}, {"web", 80, 0, ""}},
+				ReservedPorts: []Port{{Label: "ssh", Value: 22}, {Label: "web", Value: 80}},
+			},
+		},
+		Devices: []*RequestedDevice{
+			{
+				Name:  "nvidia/gpu/Tesla M60",
+				Count: 1,
 			},
 		},
 	}
@@ -3818,7 +3901,7 @@ func TestResource_Add_Network(t *testing.T) {
 		Networks: []*NetworkResource{
 			{
 				MBits:        50,
-				DynamicPorts: []Port{{"http", 0, 80, ""}, {"https", 0, 443, ""}},
+				DynamicPorts: []Port{{Label: "http", To: 80}, {Label: "https", To: 443}},
 			},
 		},
 	}
@@ -3826,7 +3909,7 @@ func TestResource_Add_Network(t *testing.T) {
 		Networks: []*NetworkResource{
 			{
 				MBits:        25,
-				DynamicPorts: []Port{{"admin", 0, 8080, ""}},
+				DynamicPorts: []Port{{Label: "admin", To: 8080}},
 			},
 		},
 	}
@@ -3838,7 +3921,7 @@ func TestResource_Add_Network(t *testing.T) {
 		Networks: []*NetworkResource{
 			{
 				MBits:        75,
-				DynamicPorts: []Port{{"http", 0, 80, ""}, {"https", 0, 443, ""}, {"admin", 0, 8080, ""}},
+				DynamicPorts: []Port{{Label: "http", To: 80}, {Label: "https", To: 443}, {Label: "admin", To: 8080}},
 			},
 		},
 	}
@@ -3865,7 +3948,7 @@ func TestComparableResources_Subtract(t *testing.T) {
 				{
 					CIDR:          "10.0.0.0/8",
 					MBits:         100,
-					ReservedPorts: []Port{{"ssh", 22, 0, ""}},
+					ReservedPorts: []Port{{Label: "ssh", Value: 22}},
 				},
 			},
 		},
@@ -3888,7 +3971,7 @@ func TestComparableResources_Subtract(t *testing.T) {
 				{
 					CIDR:          "10.0.0.0/8",
 					MBits:         20,
-					ReservedPorts: []Port{{"ssh", 22, 0, ""}},
+					ReservedPorts: []Port{{Label: "ssh", Value: 22}},
 				},
 			},
 		},
@@ -3912,7 +3995,7 @@ func TestComparableResources_Subtract(t *testing.T) {
 				{
 					CIDR:          "10.0.0.0/8",
 					MBits:         100,
-					ReservedPorts: []Port{{"ssh", 22, 0, ""}},
+					ReservedPorts: []Port{{Label: "ssh", Value: 22}},
 				},
 			},
 		},
@@ -4981,6 +5064,17 @@ func TestTaskArtifact_Hash(t *testing.T) {
 			GetterMode:     "g",
 			GetterInsecure: true,
 			RelativeDest:   "i",
+		},
+		{
+			GetterSource: "b",
+			GetterOptions: map[string]string{
+				"c": "c",
+				"d": "e",
+			},
+			GetterMode:     "g",
+			GetterInsecure: true,
+			RelativeDest:   "i",
+			Chown:          true,
 		},
 	}
 
@@ -6428,10 +6522,17 @@ func TestDispatchPayloadConfig_Validate(t *testing.T) {
 func TestScalingPolicy_Canonicalize(t *testing.T) {
 	ci.Parallel(t)
 
+	job := &Job{Namespace: "prod", ID: "example"}
+	tg := &TaskGroup{Name: "web"}
+	task := &Task{Name: "httpd"}
+
 	cases := []struct {
 		name     string
 		input    *ScalingPolicy
 		expected *ScalingPolicy
+		job      *Job
+		tg       *TaskGroup
+		task     *Task
 	}{
 		{
 			name:     "empty policy",
@@ -6443,14 +6544,42 @@ func TestScalingPolicy_Canonicalize(t *testing.T) {
 			input:    &ScalingPolicy{Type: "other-type"},
 			expected: &ScalingPolicy{Type: "other-type"},
 		},
+		{
+			name:  "policy with type and task group",
+			input: &ScalingPolicy{Type: "other-type"},
+			expected: &ScalingPolicy{
+				Type: "other-type",
+				Target: map[string]string{
+					ScalingTargetNamespace: "prod",
+					ScalingTargetJob:       "example",
+					ScalingTargetGroup:     "web",
+				},
+			},
+			job: job,
+			tg:  tg,
+		},
+		{
+			name:  "policy with type and task",
+			input: &ScalingPolicy{Type: "other-type"},
+			expected: &ScalingPolicy{
+				Type: "other-type",
+				Target: map[string]string{
+					ScalingTargetNamespace: "prod",
+					ScalingTargetJob:       "example",
+					ScalingTargetGroup:     "web",
+					ScalingTargetTask:      "httpd",
+				},
+			},
+			job:  job,
+			tg:   tg,
+			task: task,
+		},
 	}
 
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			require := require.New(t)
-
-			c.input.Canonicalize()
-			require.Equal(c.expected, c.input)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.input.Canonicalize(tc.job, tc.tg, tc.task)
+			must.Eq(t, tc.expected, tc.input)
 		})
 	}
 }
@@ -6726,12 +6855,12 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 			},
 			true,
@@ -6742,12 +6871,12 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:            "10.0.0.0",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 			},
 			false,
@@ -6758,12 +6887,12 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:            "10.0.0.1",
 					MBits:         40,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 			},
 			false,
@@ -6774,12 +6903,12 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}, {"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}, {Label: "web", Value: 80}},
 				},
 			},
 			false,
@@ -6790,7 +6919,7 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:            "10.0.0.1",
@@ -6806,12 +6935,12 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"web", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:            "10.0.0.1",
 					MBits:         50,
-					ReservedPorts: []Port{{"notweb", 80, 0, ""}},
+					ReservedPorts: []Port{{Label: "notweb", Value: 80}},
 				},
 			},
 			false,
@@ -6822,12 +6951,12 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:           "10.0.0.1",
 					MBits:        50,
-					DynamicPorts: []Port{{"web", 80, 0, ""}},
+					DynamicPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:           "10.0.0.1",
 					MBits:        50,
-					DynamicPorts: []Port{{"web", 80, 0, ""}, {"web", 80, 0, ""}},
+					DynamicPorts: []Port{{Label: "web", Value: 80}, {Label: "web", Value: 80}},
 				},
 			},
 			false,
@@ -6838,7 +6967,7 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:           "10.0.0.1",
 					MBits:        50,
-					DynamicPorts: []Port{{"web", 80, 0, ""}},
+					DynamicPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:           "10.0.0.1",
@@ -6854,12 +6983,12 @@ func TestNetworkResourcesEquals(t *testing.T) {
 				{
 					IP:           "10.0.0.1",
 					MBits:        50,
-					DynamicPorts: []Port{{"web", 80, 0, ""}},
+					DynamicPorts: []Port{{Label: "web", Value: 80}},
 				},
 				{
 					IP:           "10.0.0.1",
 					MBits:        50,
-					DynamicPorts: []Port{{"notweb", 80, 0, ""}},
+					DynamicPorts: []Port{{Label: "notweb", Value: 80}},
 				},
 			},
 			false,
@@ -7367,7 +7496,7 @@ func TestAllocatedResources_Canonicalize(t *testing.T) {
 						Networks: Networks{
 							{
 								IP:           "127.0.0.1",
-								DynamicPorts: []Port{{"admin", 8080, 0, "default"}},
+								DynamicPorts: []Port{{Label: "admin", Value: 8080, HostNetwork: "default"}},
 							},
 						},
 					},
@@ -7379,7 +7508,7 @@ func TestAllocatedResources_Canonicalize(t *testing.T) {
 						Networks: Networks{
 							{
 								IP:           "127.0.0.1",
-								DynamicPorts: []Port{{"admin", 8080, 0, "default"}},
+								DynamicPorts: []Port{{Label: "admin", Value: 8080, HostNetwork: "default"}},
 							},
 						},
 					},
@@ -7403,7 +7532,7 @@ func TestAllocatedResources_Canonicalize(t *testing.T) {
 						Networks: Networks{
 							{
 								IP:           "127.0.0.1",
-								DynamicPorts: []Port{{"admin", 8080, 0, "default"}},
+								DynamicPorts: []Port{{Label: "admin", Value: 8080, HostNetwork: "default"}},
 							},
 						},
 					},
@@ -7425,7 +7554,7 @@ func TestAllocatedResources_Canonicalize(t *testing.T) {
 						Networks: Networks{
 							{
 								IP:           "127.0.0.1",
-								DynamicPorts: []Port{{"admin", 8080, 0, "default"}},
+								DynamicPorts: []Port{{Label: "admin", Value: 8080, HostNetwork: "default"}},
 							},
 						},
 					},
@@ -7742,7 +7871,7 @@ func TestTaskArtifact_Equal(t *testing.T) {
 	ci.Parallel(t)
 
 	must.Equal[*TaskArtifact](t, nil, nil)
-	must.NotEqual[*TaskArtifact](t, nil, new(TaskArtifact))
+	must.NotEqual(t, nil, new(TaskArtifact))
 
 	must.StructEqual(t, &TaskArtifact{
 		GetterSource:  "source",
@@ -7765,7 +7894,11 @@ func TestTaskArtifact_Equal(t *testing.T) {
 	}, {
 		Field: "RelativeDest",
 		Apply: func(ta *TaskArtifact) { ta.RelativeDest = "./alloc" },
-	}})
+	}, {
+		Field: "Chown",
+		Apply: func(ta *TaskArtifact) { ta.Chown = true },
+	},
+	})
 }
 
 func TestVault_Equal(t *testing.T) {
@@ -8015,484 +8148,4 @@ func TestTaskIdentity_Canonicalize(t *testing.T) {
 	must.Len(t, 0, task.Identities[1].Audience)
 	must.True(t, task.Identities[1].Env)
 	must.False(t, task.Identities[1].File)
-}
-
-func TestNewIdentityClaims(t *testing.T) {
-	ci.Parallel(t)
-
-	job := &Job{
-		ID:        "job",
-		Name:      "job",
-		Namespace: "default",
-		Region:    "global",
-
-		TaskGroups: []*TaskGroup{
-			{
-				Name: "group",
-				Services: []*Service{{
-					Name:      "group-service-",
-					PortLabel: "http",
-					Identity: &WorkloadIdentity{
-						Audience: []string{"group-service.consul.io"},
-					},
-				}},
-				Tasks: []*Task{
-					{
-						Name: "task",
-						Identity: &WorkloadIdentity{
-							Name:     "default-identity",
-							Audience: []string{"example.com"},
-						},
-						Identities: []*WorkloadIdentity{
-							{
-								Name:     "alt-identity",
-								Audience: []string{"alt.example.com"},
-							},
-							{
-								Name:     "consul_default",
-								Audience: []string{"consul.io"},
-							},
-							{
-								Name:     "vault_default",
-								Audience: []string{"vault.io"},
-							},
-						},
-						Services: []*Service{{
-							Name:      "task-service",
-							PortLabel: "http",
-							Identity: &WorkloadIdentity{
-								Audience: []string{"task-service.consul.io"},
-							},
-						}},
-					},
-					{
-						Name: "consul-vault-task",
-						Consul: &Consul{
-							Namespace: "task-consul-namespace",
-						},
-						Vault: &Vault{
-							Namespace: "vault-namespace",
-							Role:      "role-from-spec-group",
-						},
-						Identity: &WorkloadIdentity{
-							Name:     "default-identity",
-							Audience: []string{"example.com"},
-						},
-						Identities: []*WorkloadIdentity{
-							{
-								Name:     "consul_default",
-								Audience: []string{"consul.io"},
-							},
-							{
-								Name:     "vault_default",
-								Audience: []string{"vault.io"},
-							},
-						},
-						Services: []*Service{{
-							Name:      "consul-task-service",
-							PortLabel: "http",
-							Identity: &WorkloadIdentity{
-								Audience: []string{"task-service.consul.io"},
-							},
-						}},
-					},
-				},
-			},
-			{
-				Name: "consul-group",
-				Consul: &Consul{
-					Namespace: "group-consul-namespace",
-				},
-				Services: []*Service{{
-					Name:      "group-service",
-					PortLabel: "http",
-					Identity: &WorkloadIdentity{
-						Audience: []string{"group-service.consul.io"},
-					},
-				}},
-				Tasks: []*Task{
-					{
-						Name: "task",
-						Identity: &WorkloadIdentity{
-							Name:     "default-identity",
-							Audience: []string{"example.com"},
-						},
-						Identities: []*WorkloadIdentity{
-							{
-								Name:     "alt-identity",
-								Audience: []string{"alt.example.com"},
-							},
-							{
-								Name:     "consul_default",
-								Audience: []string{"consul.io"},
-							},
-							{
-								Name:     "vault_default",
-								Audience: []string{"vault.io"},
-							},
-						},
-						Services: []*Service{{
-							Name:      "task-service",
-							PortLabel: "http",
-							Identity: &WorkloadIdentity{
-								Audience: []string{"task-service.consul.io"},
-							},
-						}},
-					},
-					{
-						Name: "consul-vault-task",
-						Consul: &Consul{
-							Namespace: "task-consul-namespace",
-						},
-						Vault: &Vault{
-							Namespace: "vault-namespace",
-							Role:      "role-from-spec-consul-group",
-						},
-						Identity: &WorkloadIdentity{
-							Name:     "default-identity",
-							Audience: []string{"example.com"},
-						},
-						Identities: []*WorkloadIdentity{
-							{
-								Name:     "consul_default",
-								Audience: []string{"consul.io"},
-							},
-							{
-								Name:     "vault_default",
-								Audience: []string{"vault.io"},
-							},
-						},
-						Services: []*Service{{
-							Name:      "consul-task-service",
-							PortLabel: "http",
-							Identity: &WorkloadIdentity{
-								Audience: []string{"consul.io"},
-							},
-						}},
-					},
-				},
-			},
-		},
-	}
-	job.Canonicalize()
-
-	expectedClaims := map[string]*IdentityClaims{
-		// group: no consul.
-		"job/group/services/group-service": {
-			Namespace:   "default",
-			JobID:       "job",
-			ServiceName: "group-service",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:group-service:consul-service_group-service-http",
-				Audience: jwt.Audience{"group-service.consul.io"},
-			},
-		},
-		// group: no consul.
-		// task:  no consul, no vault.
-		"job/group/task/default-identity": {
-			Namespace: "default",
-			JobID:     "job",
-			TaskName:  "task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:task:default-identity",
-				Audience: jwt.Audience{"example.com"},
-			},
-		},
-		"job/group/task/alt-identity": {
-			Namespace: "default",
-			JobID:     "job",
-			TaskName:  "task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:task:alt-identity",
-				Audience: jwt.Audience{"alt.example.com"},
-			},
-		},
-		// No ConsulNamespace because there is no consul block at either task
-		// or group level.
-		"job/group/task/consul_default": {
-			ConsulNamespace: "",
-			Namespace:       "default",
-			JobID:           "job",
-			TaskName:        "task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:task:consul_default",
-				Audience: jwt.Audience{"consul.io"},
-			},
-		},
-		// No VaultNamespace because there is no vault block at either task
-		// or group level.
-		"job/group/task/vault_default": {
-			VaultNamespace: "",
-			Namespace:      "default",
-			JobID:          "job",
-			TaskName:       "task",
-			VaultRole:      "", // not specified in jobspec
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:task:vault_default",
-				Audience: jwt.Audience{"vault.io"},
-			},
-		},
-		"job/group/task/services/task-service": {
-			Namespace:   "default",
-			JobID:       "job",
-			ServiceName: "task-service",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:task-service:consul-service_task-task-service-http",
-				Audience: jwt.Audience{"task-service.consul.io"},
-			},
-		},
-		// group: no consul.
-		// task:  with consul, with vault.
-		"job/group/consul-vault-task/default-identity": {
-			Namespace: "default",
-			JobID:     "job",
-			TaskName:  "consul-vault-task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:consul-vault-task:default-identity",
-				Audience: jwt.Audience{"example.com"},
-			},
-		},
-		// Use task-level Consul namespace.
-		"job/group/consul-vault-task/consul_default": {
-			ConsulNamespace: "task-consul-namespace",
-			Namespace:       "default",
-			JobID:           "job",
-			TaskName:        "consul-vault-task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:consul-vault-task:consul_default",
-				Audience: jwt.Audience{"consul.io"},
-			},
-		},
-		// Use task-level Vault namespace.
-		"job/group/consul-vault-task/vault_default": {
-			VaultNamespace: "vault-namespace",
-			Namespace:      "default",
-			JobID:          "job",
-			TaskName:       "consul-vault-task",
-			VaultRole:      "role-from-spec-group",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:consul-vault-task:vault_default",
-				Audience: jwt.Audience{"vault.io"},
-			},
-		},
-		// Use task-level Consul namespace for task services.
-		"job/group/consul-vault-task/services/consul-vault-task-service": {
-			ConsulNamespace: "task-consul-namespace",
-			Namespace:       "default",
-			JobID:           "job",
-			ServiceName:     "consul-vault-task-service",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:group:consul-vault-task-service:consul-service_consul-vault-task-service-http",
-				Audience: jwt.Audience{"consul.io"},
-			},
-		},
-		// group: with consul.
-		// Use group-level Consul namespace for group services.
-		"job/consul-group/services/group-service": {
-			ConsulNamespace: "group-consul-namespace",
-			Namespace:       "default",
-			JobID:           "job",
-			ServiceName:     "group-service",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:group-service:consul-service_group-service-http",
-				Audience: jwt.Audience{"group-service.consul.io"},
-			},
-		},
-		// group: with consul.
-		// task:  no consul, no vault.
-		"job/consul-group/task/default-identity": {
-			Namespace: "default",
-			JobID:     "job",
-			TaskName:  "task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:task:default-identity",
-				Audience: jwt.Audience{"example.com"},
-			},
-		},
-		"job/consul-group/task/alt-identity": {
-			Namespace: "default",
-			JobID:     "job",
-			TaskName:  "task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:task:alt-identity",
-				Audience: jwt.Audience{"alt.example.com"},
-			},
-		},
-		// Use group-level Consul namespace because task doesn't have a consul
-		// block.
-		"job/consul-group/task/consul_default": {
-			ConsulNamespace: "group-consul-namespace",
-			Namespace:       "default",
-			JobID:           "job",
-			TaskName:        "task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:task:consul_default",
-				Audience: jwt.Audience{"consul.io"},
-			},
-		},
-		"job/consul-group/task/vault_default": {
-			Namespace: "default",
-			JobID:     "job",
-			TaskName:  "task",
-			VaultRole: "", // not specified in jobspec
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:task:vault_default",
-				Audience: jwt.Audience{"vault.io"},
-			},
-		},
-		// Use group-level Consul namespace for task service because task
-		// doesn't have a consul block.
-		"job/consul-group/task/services/task-service": {
-			ConsulNamespace: "group-consul-namespace",
-			Namespace:       "default",
-			JobID:           "job",
-			ServiceName:     "task-service",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:task-service:consul-service_task-task-service-http",
-				Audience: jwt.Audience{"task-service.consul.io"},
-			},
-		},
-		// group: no consul.
-		// task:  with consul, with vault.
-		"job/consul-group/consul-vault-task/default-identity": {
-			Namespace: "default",
-			JobID:     "job",
-			TaskName:  "consul-vault-task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:consul-vault-task:default-identity",
-				Audience: jwt.Audience{"example.com"},
-			},
-		},
-		// Use task-level Consul namespace.
-		"job/consul-group/consul-vault-task/consul_default": {
-			ConsulNamespace: "task-consul-namespace",
-			Namespace:       "default",
-			JobID:           "job",
-			TaskName:        "consul-vault-task",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:consul-vault-task:consul_default",
-				Audience: jwt.Audience{"consul.io"},
-			},
-		},
-		"job/consul-group/consul-vault-task/vault_default": {
-			VaultNamespace: "vault-namespace",
-			Namespace:      "default",
-			JobID:          "job",
-			TaskName:       "consul-vault-task",
-			VaultRole:      "role-from-spec-consul-group",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:consul-vault-task:vault_default",
-				Audience: jwt.Audience{"vault.io"},
-			},
-		},
-		// Use task-level Consul namespace for task services.
-		"job/consul-group/consul-vault-task/services/consul-task-service": {
-			ConsulNamespace: "task-consul-namespace",
-			Namespace:       "default",
-			JobID:           "job",
-			ServiceName:     "consul-task-service",
-			Claims: jwt.Claims{
-				Subject:  "global:default:job:consul-group:consul-task-service:consul-service_consul-vault-task-consul-task-service-http",
-				Audience: jwt.Audience{"consul.io"},
-			},
-		},
-	}
-
-	// Generate service identity names.
-	for _, tg := range job.TaskGroups {
-		for _, s := range tg.Services {
-			if s.Identity != nil {
-				s.Identity.Name = s.MakeUniqueIdentityName()
-			}
-		}
-		for _, t := range tg.Tasks {
-			for _, s := range t.Services {
-				if s.Identity != nil {
-					s.Identity.Name = s.MakeUniqueIdentityName()
-				}
-			}
-		}
-	}
-
-	// Find all indentites in test job and create a test case for each.
-	// Tests for identities missing from expectedClaims are skipped.
-	type testCase struct {
-		name           string
-		group          string
-		wid            *WorkloadIdentity
-		wiHandle       *WIHandle
-		expectedClaims *IdentityClaims
-	}
-	testCases := []testCase{}
-	for _, tg := range job.TaskGroups {
-		path := job.ID + "/" + tg.Name
-
-		for _, s := range tg.Services {
-			path := path + "/services/" + s.Name
-
-			testCases = append(testCases, testCase{
-				name:           path,
-				group:          tg.Name,
-				wid:            s.Identity,
-				wiHandle:       s.IdentityHandle(nil),
-				expectedClaims: expectedClaims[path],
-			})
-		}
-
-		for _, t := range tg.Tasks {
-			path := path + "/" + t.Name
-
-			for _, wid := range append(t.Identities, t.Identity) {
-				if wid == nil {
-					continue
-				}
-
-				path := path + "/" + wid.Name
-				testCases = append(testCases, testCase{
-					name:           path,
-					group:          tg.Name,
-					wid:            wid,
-					wiHandle:       t.IdentityHandle(wid),
-					expectedClaims: expectedClaims[path],
-				})
-			}
-
-			for _, s := range t.Services {
-				path := path + "/services/" + s.Name
-				testCases = append(testCases, testCase{
-					name:           path,
-					group:          tg.Name,
-					wid:            s.Identity,
-					wiHandle:       s.IdentityHandle(nil),
-					expectedClaims: expectedClaims[path],
-				})
-			}
-		}
-	}
-
-	for _, tc := range testCases {
-		t.Run(tc.name, func(t *testing.T) {
-			if tc.expectedClaims == nil {
-				t.Skip("missing expected claims")
-			}
-
-			now := time.Now()
-			alloc := &Allocation{
-				ID:        uuid.Generate(),
-				Namespace: job.Namespace,
-				JobID:     job.ID,
-				TaskGroup: tc.group,
-			}
-
-			got := NewIdentityClaims(job, alloc, tc.wiHandle, tc.wid, now)
-
-			must.Eq(t, tc.expectedClaims, got, must.Cmp(cmpopts.IgnoreFields(
-				IdentityClaims{},
-				"ID", "AllocationID", "IssuedAt", "NotBefore",
-			)))
-			must.Eq(t, alloc.ID, got.AllocationID)
-			must.Eq(t, jwt.NewNumericDate(now), got.IssuedAt)
-			must.Eq(t, jwt.NewNumericDate(now), got.NotBefore)
-		})
-	}
 }

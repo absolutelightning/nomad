@@ -90,7 +90,7 @@ export default class Job extends Model {
 
   /**
    * @typedef {Object} CurrentStatus
-   * @property {"Healthy"|"Failed"|"Deploying"|"Degraded"|"Recovering"|"Complete"|"Running"|"Removed"|"Stopped"} label - The current status of the job
+   * @property {"Healthy"|"Failed"|"Deploying"|"Degraded"|"Recovering"|"Complete"|"Running"|"Removed"|"Stopped"|"Scaled Down"} label - The current status of the job
    * @property {"highlight"|"success"|"warning"|"critical"|"neutral"} state -
    */
 
@@ -226,6 +226,7 @@ export default class Job extends Model {
    * - Failed: All allocations are failed, lost, or unplaced
    * - Removed: The job appeared in our initial query, but has since been garbage collected
    * - Stopped: The job has been manually stopped (and not purged or yet garbage collected) by a user
+   * - Scaled Down: The job is intentionally scaled down to 0 desired allocations (all task groups have count=0)
    * @returns {CurrentStatus}
    */
   /**
@@ -246,6 +247,12 @@ export default class Job extends Model {
         label: 'Stopped',
         state: 'neutral',
       };
+    }
+
+    // If the job is scaled down to 0 desired allocations, we shouldn't call it "failed";
+    // we should indicate that it is deliberately set to not have any running parts.
+    if (totalAllocs === 0) {
+      return { label: 'Scaled Down', state: 'neutral' };
     }
 
     // If the job was requested initially, but a subsequent request for it was
@@ -302,9 +309,7 @@ export default class Job extends Model {
   }
   @fragment('structured-attributes') meta;
 
-  get isPack() {
-    return !!this.meta?.structured?.pack;
-  }
+  @attr('boolean') isPack;
 
   /**
    * A task with a schedule block can have execution paused at specific cron-based times.
@@ -426,7 +431,7 @@ export default class Job extends Model {
 
   @attr('number') version;
 
-  @hasMany('job-versions') versions;
+  @hasMany('job-versions', { async: true }) versions;
   @hasMany('allocations') allocations;
   @hasMany('deployments') deployments;
   @hasMany('evaluations') evaluations;
@@ -568,6 +573,9 @@ export default class Job extends Model {
     return this.store.adapterFor('job').update(this);
   }
 
+  getVersions(diffVersion) {
+    return this.store.adapterFor('job').getVersions(this, diffVersion);
+  }
   parse() {
     const definition = this._newDefinition;
     const variables = this._newDefinitionVariables;

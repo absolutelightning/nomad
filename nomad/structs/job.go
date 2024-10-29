@@ -4,7 +4,7 @@
 package structs
 
 import (
-	"github.com/hashicorp/go-set/v2"
+	"github.com/hashicorp/go-set/v3"
 )
 
 const (
@@ -98,6 +98,7 @@ type JobStatusesJob struct {
 	ParentID         string
 	LatestDeployment *JobStatusesLatestDeployment
 	Stop             bool // has the job been manually stopped?
+	IsPack           bool // is pack metadata present?
 	Status           string
 }
 

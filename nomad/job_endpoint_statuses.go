@@ -10,7 +10,7 @@ import (
 
 	"github.com/armon/go-metrics"
 	"github.com/hashicorp/go-memdb"
-	"github.com/hashicorp/go-set/v2"
+	"github.com/hashicorp/go-set/v3"
 	"github.com/hashicorp/nomad/acl"
 	"github.com/hashicorp/nomad/nomad/state"
 	"github.com/hashicorp/nomad/nomad/state/paginator"
@@ -220,6 +220,8 @@ func jobStatusesJobFromJob(ws memdb.WatchSet, store *state.StateStore, job *stru
 		Stop:             job.Stop,
 		Status:           job.Status,
 	}
+
+	_, jsj.IsPack = job.Meta["pack.name"]
 
 	// the GroupCountSum will map to how many allocations we expect to run
 	// (for service jobs)

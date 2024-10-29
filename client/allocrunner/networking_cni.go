@@ -11,6 +11,7 @@ package allocrunner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
@@ -24,10 +25,9 @@ import (
 
 	cni "github.com/containerd/go-cni"
 	cnilibrary "github.com/containernetworking/cni/libcni"
-	"github.com/coreos/go-iptables/iptables"
 	consulIPTables "github.com/hashicorp/consul/sdk/iptables"
 	log "github.com/hashicorp/go-hclog"
-	"github.com/hashicorp/go-set/v2"
+	"github.com/hashicorp/go-set/v3"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/envoy"
 	"github.com/hashicorp/nomad/nomad/structs"
@@ -51,33 +51,35 @@ const (
 
 type cniNetworkConfigurator struct {
 	cni                     cni.CNI
-	cniConf                 []byte
+	confParser              *cniConfParser
 	ignorePortMappingHostIP bool
 	nodeAttrs               map[string]string
 	nodeMeta                map[string]string
 	rand                    *rand.Rand
 	logger                  log.Logger
 	nsOpts                  *nsOpts
+	newIPTables             func(structs.NodeNetworkAF) (IPTablesCleanup, error)
 }
 
 func newCNINetworkConfigurator(logger log.Logger, cniPath, cniInterfacePrefix, cniConfDir, networkName string, ignorePortMappingHostIP bool, node *structs.Node) (*cniNetworkConfigurator, error) {
-	cniConf, err := loadCNIConf(cniConfDir, networkName)
+	parser, err := loadCNIConf(cniConfDir, networkName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load CNI config: %v", err)
 	}
 
-	return newCNINetworkConfiguratorWithConf(logger, cniPath, cniInterfacePrefix, ignorePortMappingHostIP, cniConf, node)
+	return newCNINetworkConfiguratorWithConf(logger, cniPath, cniInterfacePrefix, ignorePortMappingHostIP, parser, node)
 }
 
-func newCNINetworkConfiguratorWithConf(logger log.Logger, cniPath, cniInterfacePrefix string, ignorePortMappingHostIP bool, cniConf []byte, node *structs.Node) (*cniNetworkConfigurator, error) {
+func newCNINetworkConfiguratorWithConf(logger log.Logger, cniPath, cniInterfacePrefix string, ignorePortMappingHostIP bool, parser *cniConfParser, node *structs.Node) (*cniNetworkConfigurator, error) {
 	conf := &cniNetworkConfigurator{
-		cniConf:                 cniConf,
+		confParser:              parser,
 		rand:                    rand.New(rand.NewSource(time.Now().Unix())),
 		logger:                  logger,
 		ignorePortMappingHostIP: ignorePortMappingHostIP,
 		nodeAttrs:               node.Attributes,
 		nodeMeta:                node.Meta,
 		nsOpts:                  &nsOpts{},
+		newIPTables:             newIPTablesCleanup,
 	}
 	if cniPath == "" {
 		if cniPath = os.Getenv(envCNIPath); cniPath == "" {
@@ -118,7 +120,7 @@ func addCustomCNIArgs(networks []*structs.NetworkResource, cniArgs map[string]st
 // Setup calls the CNI plugins with the add action
 func (c *cniNetworkConfigurator) Setup(ctx context.Context, alloc *structs.Allocation, spec *drivers.NetworkIsolationSpec) (*structs.AllocNetworkStatus, error) {
 	if err := c.ensureCNIInitialized(); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cni not initialized: %w", err)
 	}
 	cniArgs := map[string]string{
 		// CNI plugins are called one after the other with the same set of
@@ -391,36 +393,51 @@ func (c *cniNetworkConfigurator) cniToAllocNet(res *cni.Result) (*structs.AllocN
 	}
 	sort.Strings(names)
 
-	// Use the first sandbox interface with an IP address
-	for _, name := range names {
-		iface := res.Interfaces[name]
-		if iface == nil {
+	// setStatus sets netStatus.Address and netStatus.InterfaceName
+	// if it finds a suitable interface that has IP address(es)
+	// (at least IPv4, possibly also IPv6)
+	setStatus := func(requireSandbox bool) {
+		for _, name := range names {
+			iface := res.Interfaces[name]
 			// this should never happen but this value is coming from external
 			// plugins so we should guard against it
-			delete(res.Interfaces, name)
-			continue
-		}
+			if iface == nil {
+				continue
+			}
 
-		if iface.Sandbox != "" && len(iface.IPConfigs) > 0 {
-			netStatus.Address = iface.IPConfigs[0].IP.String()
-			netStatus.InterfaceName = name
-			break
+			if requireSandbox && iface.Sandbox == "" {
+				continue
+			}
+
+			for _, ipConfig := range iface.IPConfigs {
+				isIP4 := ipConfig.IP.To4() != nil
+				if netStatus.Address == "" && isIP4 {
+					netStatus.Address = ipConfig.IP.String()
+				}
+				if netStatus.AddressIPv6 == "" && !isIP4 {
+					netStatus.AddressIPv6 = ipConfig.IP.String()
+				}
+			}
+
+			// found a good interface, so we're done
+			if netStatus.Address != "" {
+				netStatus.InterfaceName = name
+				return
+			}
 		}
 	}
+
+	// Use the first sandbox interface with an IP address
+	setStatus(true)
 
 	// If no IP address was found, use the first interface with an address
 	// found as a fallback
 	if netStatus.Address == "" {
-		for _, name := range names {
-			iface := res.Interfaces[name]
-			if len(iface.IPConfigs) > 0 {
-				ip := iface.IPConfigs[0].IP.String()
-				c.logger.Debug("no sandbox interface with an address found CNI result, using first available", "interface", name, "ip", ip)
-				netStatus.Address = ip
-				netStatus.InterfaceName = name
-				break
-			}
-		}
+		setStatus(false)
+		c.logger.Debug("no sandbox interface with an address found CNI result, using first available",
+			"interface", netStatus.InterfaceName,
+			"ip", netStatus.Address,
+		)
 	}
 
 	// If no IP address could be found, return an error
@@ -444,7 +461,26 @@ func (c *cniNetworkConfigurator) cniToAllocNet(res *cni.Result) (*structs.AllocN
 	return netStatus, nil
 }
 
-func loadCNIConf(confDir, name string) ([]byte, error) {
+// cniConfParser parses different config formats as appropriate
+type cniConfParser struct {
+	listBytes []byte
+	confBytes []byte
+}
+
+// getOpt produces a cni.Opt to load with cni.CNI.Load()
+func (c *cniConfParser) getOpt() (cni.Opt, error) {
+	if len(c.listBytes) > 0 {
+		return cni.WithConfListBytes(c.listBytes), nil
+	}
+	if len(c.confBytes) > 0 {
+		return cni.WithConf(c.confBytes), nil
+	}
+	// theoretically should never be reached
+	return nil, errors.New("no CNI network config found")
+}
+
+// loadCNIConf looks in confDir for a CNI config with the specified name
+func loadCNIConf(confDir, name string) (*cniConfParser, error) {
 	files, err := cnilibrary.ConfFiles(confDir, []string{".conf", ".conflist", ".json"})
 	switch {
 	case err != nil:
@@ -463,7 +499,9 @@ func loadCNIConf(confDir, name string) ([]byte, error) {
 				return nil, fmt.Errorf("failed to load CNI config list file %s: %v", confFile, err)
 			}
 			if confList.Name == name {
-				return confList.Bytes, nil
+				return &cniConfParser{
+					listBytes: confList.Bytes,
+				}, nil
 			}
 		} else {
 			conf, err := cnilibrary.ConfFromFile(confFile)
@@ -471,7 +509,9 @@ func loadCNIConf(confDir, name string) ([]byte, error) {
 				return nil, fmt.Errorf("failed to load CNI config file %s: %v", confFile, err)
 			}
 			if conf.Network.Name == name {
-				return conf.Bytes, nil
+				return &cniConfParser{
+					confBytes: conf.Bytes,
+				}, nil
 			}
 		}
 	}
@@ -488,8 +528,20 @@ func (c *cniNetworkConfigurator) Teardown(ctx context.Context, alloc *structs.Al
 	portMap := getPortMapping(alloc, c.ignorePortMappingHostIP)
 
 	if err := c.cni.Remove(ctx, alloc.ID, spec.Path, cni.WithCapabilityPortMap(portMap.ports)); err != nil {
+		c.logger.Warn("error from cni.Remove; attempting manual iptables cleanup", "err", err)
+
+		// best effort cleanup ipv6
+		ipt, iptErr := c.newIPTables(structs.NodeNetworkAF_IPv6)
+		if iptErr != nil {
+			c.logger.Debug("failed to detect ip6tables: %v", iptErr)
+		} else {
+			if err := c.forceCleanup(ipt, alloc.ID); err != nil {
+				c.logger.Warn("ip6tables: %v", err)
+			}
+		}
+
 		// create a real handle to iptables
-		ipt, iptErr := iptables.New()
+		ipt, iptErr = c.newIPTables(structs.NodeNetworkAF_IPv4)
 		if iptErr != nil {
 			return fmt.Errorf("failed to detect iptables: %w", iptErr)
 		}
@@ -498,13 +550,6 @@ func (c *cniNetworkConfigurator) Teardown(ctx context.Context, alloc *structs.Al
 	}
 
 	return nil
-}
-
-// IPTables is a subset of iptables.IPTables
-type IPTables interface {
-	List(table, chain string) ([]string, error)
-	Delete(table, chain string, rule ...string) error
-	ClearAndDeleteChain(table, chain string) error
 }
 
 var (
@@ -517,7 +562,7 @@ var (
 // an allocation that was using bridge networking. The cni library refuses to handle a
 // dirty state - e.g. the pause container is removed out of band, and so we must cleanup
 // iptables ourselves to avoid leaking rules.
-func (c *cniNetworkConfigurator) forceCleanup(ipt IPTables, allocID string) error {
+func (c *cniNetworkConfigurator) forceCleanup(ipt IPTablesCleanup, allocID string) error {
 	const (
 		natTable         = "nat"
 		postRoutingChain = "POSTROUTING"
@@ -542,7 +587,8 @@ func (c *cniNetworkConfigurator) forceCleanup(ipt IPTables, allocID string) erro
 
 	// no rule found for our allocation, just give up
 	if ruleToPurge == "" {
-		return fmt.Errorf("failed to find postrouting rule for alloc %s", allocID)
+		c.logger.Info("iptables cleanup: did not find postrouting rule for alloc", "alloc_id", allocID)
+		return nil
 	}
 
 	// re-create the rule we need to delete, as tokens
@@ -585,11 +631,14 @@ func (c *cniNetworkConfigurator) forceCleanup(ipt IPTables, allocID string) erro
 }
 
 func (c *cniNetworkConfigurator) ensureCNIInitialized() error {
-	if err := c.cni.Status(); cni.IsCNINotInitialized(err) {
-		return c.cni.Load(cni.WithConfListBytes(c.cniConf))
-	} else {
+	if err := c.cni.Status(); !cni.IsCNINotInitialized(err) {
 		return err
 	}
+	opt, err := c.confParser.getOpt()
+	if err != nil {
+		return err
+	}
+	return c.cni.Load(opt)
 }
 
 // nsOpts keeps track of NamespaceOpts usage, mainly for test assertions.

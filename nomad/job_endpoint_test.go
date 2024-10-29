@@ -156,6 +156,7 @@ func TestJobEndpoint_Register_NonOverlapping(t *testing.T) {
 		WriteRequest: structs.WriteRequest{
 			Region:    "global",
 			Namespace: job.Namespace,
+			AuthToken: node.SecretID,
 		},
 	}
 
@@ -6627,7 +6628,8 @@ func TestJobEndpoint_Plan_Scaling(t *testing.T) {
 	tg := job.TaskGroups[0]
 	tg.Tasks[0].Resources.MemoryMB = 999999999
 	scaling := &structs.ScalingPolicy{Min: 1, Max: 100, Type: structs.ScalingPolicyTypeHorizontal}
-	tg.Scaling = scaling.TargetTaskGroup(job, tg)
+	scaling.Canonicalize(job, tg, nil)
+	tg.Scaling = scaling
 	planReq := &structs.JobPlanRequest{
 		Job:  job,
 		Diff: false,

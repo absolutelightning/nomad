@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"testing"
 	"time"
 
 	hclog "github.com/hashicorp/go-hclog"
@@ -25,7 +26,6 @@ import (
 	"github.com/hashicorp/nomad/plugins/drivers"
 	"github.com/hashicorp/nomad/plugins/drivers/fsisolation"
 	"github.com/hashicorp/nomad/plugins/shared/hclspec"
-	testing "github.com/mitchellh/go-testing-interface"
 	"github.com/shoenig/test/must"
 )
 
@@ -33,7 +33,7 @@ type DriverHarness struct {
 	drivers.DriverPlugin
 	client *plugin.GRPCClient
 	server *plugin.GRPCServer
-	t      testing.T
+	t      *testing.T
 	logger hclog.Logger
 	impl   drivers.DriverPlugin
 	cgroup string
@@ -42,7 +42,7 @@ type DriverHarness struct {
 func (h *DriverHarness) Impl() drivers.DriverPlugin {
 	return h.impl
 }
-func NewDriverHarness(t testing.T, d drivers.DriverPlugin) *DriverHarness {
+func NewDriverHarness(t *testing.T, d drivers.DriverPlugin) *DriverHarness {
 	logger := testlog.HCLogger(t).Named("driver_harness")
 	pd := drivers.NewDriverPlugin(d, logger)
 
@@ -92,7 +92,12 @@ func (h *DriverHarness) MkAllocDir(t *drivers.TaskConfig, enableLogs bool) func(
 
 	t.AllocDir = allocDir.AllocDir
 
-	taskDir := allocDir.NewTaskDir(t.Name)
+	task := &structs.Task{
+		Name: t.Name,
+		Env:  t.Env,
+	}
+
+	taskDir := allocDir.NewTaskDir(task)
 
 	caps, err := h.Capabilities()
 	must.NoError(h.t, err)
@@ -100,11 +105,6 @@ func (h *DriverHarness) MkAllocDir(t *drivers.TaskConfig, enableLogs bool) func(
 	fsi := caps.FSIsolation
 	h.logger.Trace("FS isolation", "fsi", fsi)
 	must.NoError(h.t, taskDir.Build(fsi, ci.TinyChroot, t.User))
-
-	task := &structs.Task{
-		Name: t.Name,
-		Env:  t.Env,
-	}
 
 	// Create the mock allocation
 	alloc := mock.Alloc()

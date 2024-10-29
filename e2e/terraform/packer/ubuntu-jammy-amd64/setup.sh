@@ -33,7 +33,7 @@ sudo apt-get install -y \
      apt-transport-https ca-certificates gnupg2 stress
 
 # Install hc-install
-curl -o /tmp/hc-install.zip https://releases.hashicorp.com/hc-install/0.5.2/hc-install_0.5.2_linux_amd64.zip
+curl -o /tmp/hc-install.zip https://releases.hashicorp.com/hc-install/0.9.0/hc-install_0.9.0_linux_amd64.zip
 sudo unzip -d /usr/local/bin /tmp/hc-install.zip
 
 # Install sockaddr
@@ -100,9 +100,12 @@ wget -q -O - \
 echo "Installing consul-cni plugin"
 sudo hc-install install --path /opt/cni/bin --version 1.5.1 consul-cni
 
-# Copy cni_args plugin and network configuration files into opt/cni/bin and opt/cni/config
-sudo mv /tmp/linux/cni_args.conflist /opt/cni/config
-sudo mv /tmp/linux/cni_args.sh /opt/cni/bin
+echo "Installing custom test plugins"
+# for .conf and .json config tests
+sudo mv /tmp/linux/cni/loopback.* /opt/cni/config/
+# cni_args test plugin and network config
+sudo mv /tmp/linux/cni/cni_args.conflist /opt/cni/config/
+sudo mv /tmp/linux/cni/cni_args.sh /opt/cni/bin/
 
 # Podman
 echo "Installing Podman"

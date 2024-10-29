@@ -19,6 +19,7 @@ import (
 	"github.com/hashicorp/nomad/nomad/structs"
 	"github.com/hashicorp/nomad/testutil"
 	"github.com/shoenig/test/must"
+	"github.com/shoenig/test/wait"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -607,6 +608,94 @@ func TestCoreScheduler_EvalGC_Batch(t *testing.T) {
 			stoppedJobLostAlloc, stoppedJobLostAlloc,
 			purgedJobCompleteAlloc,
 		})
+}
+
+// A job that has any of its versions tagged should not be GC-able.
+func TestCoreScheduler_EvalGC_JobVersionTag(t *testing.T) {
+	ci.Parallel(t)
+
+	s1, cleanupS1 := TestServer(t, nil)
+	defer cleanupS1()
+	testutil.WaitForLeader(t, s1.RPC)
+
+	store := s1.fsm.State()
+	job := mock.MinJob()
+	job.Stop = true // to be GC-able
+
+	// to be GC-able, the job needs an associated eval with a terminal Status,
+	// so that the job gets considered "dead" and not "pending"
+	// NOTE: this needs to come before UpsertJob for some Mystery Reason
+	//       (otherwise job Status ends up as "pending" later)
+	eval := mock.Eval()
+	eval.JobID = job.ID
+	eval.Status = structs.EvalStatusComplete
+	must.NoError(t, store.UpsertEvals(structs.MsgTypeTestSetup, 999, []*structs.Evaluation{eval}))
+	// upsert a couple versions of the job, so the "jobs" table has one
+	// and the "job_version" table has two.
+	must.NoError(t, store.UpsertJob(structs.MsgTypeTestSetup, 1000, nil, job.Copy()))
+	must.NoError(t, store.UpsertJob(structs.MsgTypeTestSetup, 1001, nil, job.Copy()))
+
+	jobExists := func(t *testing.T) bool {
+		t.Helper()
+		// any job at all
+		jobs, err := store.Jobs(nil, state.SortDefault)
+		must.NoError(t, err, must.Sprint("error getting jobs"))
+		return jobs.Next() != nil
+	}
+	forceGC := func(t *testing.T) {
+		t.Helper()
+		snap, err := store.Snapshot()
+		must.NoError(t, err)
+		core := NewCoreScheduler(s1, snap)
+
+		idx, err := store.LatestIndex()
+		must.NoError(t, err)
+		gc := s1.coreJobEval(structs.CoreJobForceGC, idx+1)
+
+		must.NoError(t, core.Process(gc))
+	}
+
+	applyTag := func(t *testing.T, idx, version uint64, name, desc string) {
+		t.Helper()
+		must.NoError(t, store.UpdateJobVersionTag(idx, job.Namespace,
+			&structs.JobApplyTagRequest{
+				JobID: job.ID,
+				Name:  name,
+				Tag: &structs.JobVersionTag{
+					Name:        name,
+					Description: desc,
+				},
+				Version: version,
+			}))
+	}
+	unsetTag := func(t *testing.T, idx uint64, name string) {
+		t.Helper()
+		must.NoError(t, store.UpdateJobVersionTag(idx, job.Namespace,
+			&structs.JobApplyTagRequest{
+				JobID: job.ID,
+				Name:  name,
+				Tag:   nil, // this triggers the deletion
+			}))
+	}
+
+	// tagging the latest version (latest of the 2 jobs, 0 and 1, is 1)
+	// will tag the job in the "jobs" table, which should protect from GC
+	applyTag(t, 2000, 1, "v1", "version 1")
+	forceGC(t)
+	must.True(t, jobExists(t), must.Sprint("latest job version being tagged should protect from GC"))
+
+	// untagging latest and tagging the oldest (only one in "job_version" table)
+	// should also protect from GC
+	unsetTag(t, 3000, "v1")
+	applyTag(t, 3001, 0, "v0", "version 0")
+	forceGC(t)
+	must.True(t, jobExists(t), must.Sprint("old job version being tagged should protect from GC"))
+
+	//untagging v0 should leave no tags left, so GC should delete the job
+	//and all its versions
+	unsetTag(t, 4000, "v0")
+	forceGC(t)
+	must.False(t, jobExists(t), must.Sprint("all tags being removed should enable GC"))
 }
 
 func TestCoreScheduler_EvalGC_Partial(t *testing.T) {
@@ -2609,32 +2698,137 @@ func TestCoreScheduler_CSIBadState_ClaimGC(t *testing.T) {
 	}
 }
 
+// TestCoreScheduler_RootKeyRotate exercises periodic rotation of the root key
+func TestCoreScheduler_RootKeyRotate(t *testing.T) {
+	ci.Parallel(t)
+
+	srv, cleanup := TestServer(t, func(c *Config) {
+		c.NumSchedulers = 0
+		c.RootKeyRotationThreshold = time.Hour
+	})
+	defer cleanup()
+	testutil.WaitForKeyring(t, srv.RPC, "global")
+
+	// active key, will never be GC'd
+	store := srv.fsm.State()
+	key0, err := store.GetActiveRootKey(nil)
+	must.NotNil(t, key0, must.Sprint("expected keyring to be bootstapped"))
+	must.NoError(t, err)
+
+	// run the core job
+	snap, err := store.Snapshot()
+	must.NoError(t, err)
+	core := NewCoreScheduler(srv, snap)
+	index := key0.ModifyIndex + 1
+	eval := srv.coreJobEval(structs.CoreJobRootKeyRotateOrGC, index)
+	c := core.(*CoreScheduler)
+
+	// Eval immediately
+	now := time.Unix(0, key0.CreateTime)
+	rotated, err := c.rootKeyRotate(eval, now)
+	must.NoError(t, err)
+	must.False(t, rotated, must.Sprint("key should not rotate"))
+
+	// Eval after half threshold has passed
+	c.snap, _ = store.Snapshot()
+	now = time.Unix(0, key0.CreateTime+(time.Minute*40).Nanoseconds())
+	rotated, err = c.rootKeyRotate(eval, now)
+	must.NoError(t, err)
+	must.True(t, rotated, must.Sprint("key should rotate"))
+
+	var key1 *structs.RootKey
+	iter, err := store.RootKeys(nil)
+	must.NoError(t, err)
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		k := raw.(*structs.RootKey)
+		if k.KeyID == key0.KeyID {
+			must.True(t, k.IsActive(), must.Sprint("expected original key to be active"))
+		} else {
+			key1 = k
+		}
+	}
+	must.NotNil(t, key1)
+	must.True(t, key1.IsPrepublished())
+	must.Eq(t, key0.CreateTime+time.Hour.Nanoseconds(), key1.PublishTime)
+
+	// Externally rotate with prepublish to add a second prepublished key
+	resp := &structs.KeyringRotateRootKeyResponse{}
+	must.NoError(t, srv.RPC("Keyring.Rotate", &structs.KeyringRotateRootKeyRequest{
+		PublishTime:  key1.PublishTime + (time.Hour * 24).Nanoseconds(),
+		WriteRequest: structs.WriteRequest{Region: srv.Region()},
+	}, resp))
+	key2 := resp.Key
+
+	// Eval again with time unchanged
+	c.snap, _ = store.Snapshot()
+	rotated, err = c.rootKeyRotate(eval, now)
+
+	iter, err = store.RootKeys(nil)
+	must.NoError(t, err)
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		k := raw.(*structs.RootKey)
+		switch k.KeyID {
+		case key0.KeyID:
+			must.True(t, k.IsActive(), must.Sprint("original key should still be active"))
+		case key1.KeyID, key2.KeyID:
+			must.True(t, k.IsPrepublished(), must.Sprint("new key should be prepublished"))
+		default:
+			t.Fatalf("should not have created any new keys: %#v", k)
+		}
+	}
+
+	// Eval again with time after publish time
+	c.snap, _ = store.Snapshot()
+	now = time.Unix(0, key1.PublishTime+(time.Minute*10).Nanoseconds())
+	rotated, err = c.rootKeyRotate(eval, now)
+
+	iter, err = store.RootKeys(nil)
+	must.NoError(t, err)
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		k := raw.(*structs.RootKey)
+		switch k.KeyID {
+		case key0.KeyID:
+			must.True(t, k.IsInactive(), must.Sprint("original key should be inactive"))
+		case key1.KeyID:
+			must.True(t, k.IsActive(), must.Sprint("prepublished key should now be active"))
+		case key2.KeyID:
+			must.True(t, k.IsPrepublished(), must.Sprint("later prepublished key should still be prepublished"))
+		default:
+			t.Fatalf("should not have created any new keys: %#v", k)
+		}
+	}
+}
+
 // TestCoreScheduler_RootKeyGC exercises root key GC
 func TestCoreScheduler_RootKeyGC(t *testing.T) {
 	ci.Parallel(t)
 
-	srv, cleanup := TestServer(t, nil)
+	srv, cleanup := TestServer(t, func(c *Config) {
+		c.NumSchedulers = 0
+		c.RootKeyRotationThreshold = time.Hour
+		c.RootKeyGCThreshold = time.Minute * 10
+	})
 	defer cleanup()
 	testutil.WaitForKeyring(t, srv.RPC, "global")
 
-	// reset the time table
-	srv.fsm.timetable.table = make([]TimeTableEntry, 1, 10)
-
 	// active key, will never be GC'd
 	store := srv.fsm.State()
-	key0, err := store.GetActiveRootKeyMeta(nil)
-	require.NotNil(t, key0, "expected keyring to be bootstapped")
-	require.NoError(t, err)
+	key0, err := store.GetActiveRootKey(nil)
+	must.NotNil(t, key0, must.Sprint("expected keyring to be bootstapped"))
+	must.NoError(t, err)
+
+	now := key0.CreateTime
+	yesterday := now - (24 * time.Hour).Nanoseconds()
 
 	// insert an "old" inactive key
-	key1 := structs.NewRootKeyMeta()
-	key1.SetInactive()
-	require.NoError(t, store.UpsertRootKeyMeta(600, key1, false))
+	key1 := structs.NewRootKey(structs.NewRootKeyMeta()).MakeInactive()
+	key1.CreateTime = yesterday
+	must.NoError(t, store.UpsertRootKey(600, key1, false))
 
 	// insert an "old" and inactive key with a variable that's using it
-	key2 := structs.NewRootKeyMeta()
-	key2.SetInactive()
-	require.NoError(t, store.UpsertRootKeyMeta(700, key2, false))
+	key2 := structs.NewRootKey(structs.NewRootKeyMeta()).MakeInactive()
+	key2.CreateTime = yesterday
+	must.NoError(t, store.UpsertRootKey(700, key2, false))
 
 	variable := mock.VariableEncrypted()
 	variable.KeyID = key2.KeyID
@@ -2643,89 +2837,95 @@ func TestCoreScheduler_RootKeyGC(t *testing.T) {
 		Op:  structs.VarOpSet,
 		Var: variable,
 	})
-	require.NoError(t, setResp.Error)
+	must.NoError(t, setResp.Error)
 
 	// insert an "old" key that's inactive but being used by an alloc
-	key3 := structs.NewRootKeyMeta()
-	key3.SetInactive()
-	require.NoError(t, store.UpsertRootKeyMeta(800, key3, false))
+	key3 := structs.NewRootKey(structs.NewRootKeyMeta()).MakeInactive()
+	key3.CreateTime = yesterday
+	must.NoError(t, store.UpsertRootKey(800, key3, false))
 
 	// insert the allocation using key3
 	alloc := mock.Alloc()
 	alloc.ClientStatus = structs.AllocClientStatusRunning
 	alloc.SigningKeyID = key3.KeyID
-	require.NoError(t, store.UpsertAllocs(
+	must.NoError(t, store.UpsertAllocs(
 		structs.MsgTypeTestSetup, 850, []*structs.Allocation{alloc}))
 
 	// insert an "old" key that's inactive but being used by an alloc
-	key4 := structs.NewRootKeyMeta()
-	key4.SetInactive()
-	require.NoError(t, store.UpsertRootKeyMeta(900, key4, false))
+	key4 := structs.NewRootKey(structs.NewRootKeyMeta()).MakeInactive()
+	key4.CreateTime = yesterday
+	must.NoError(t, store.UpsertRootKey(900, key4, false))
 
 	// insert the dead allocation using key4
 	alloc2 := mock.Alloc()
 	alloc2.ClientStatus = structs.AllocClientStatusFailed
 	alloc2.DesiredStatus = structs.AllocDesiredStatusStop
 	alloc2.SigningKeyID = key4.KeyID
-	require.NoError(t, store.UpsertAllocs(
+	must.NoError(t, store.UpsertAllocs(
 		structs.MsgTypeTestSetup, 950, []*structs.Allocation{alloc2}))
 
-	// insert a time table index before the last key
-	tt := srv.fsm.TimeTable()
-	tt.Witness(1000, time.Now().UTC().Add(-1*srv.config.RootKeyGCThreshold))
+	// insert an inactive key older than RootKeyGCThreshold but not RootKeyRotationThreshold
+	key5 := structs.NewRootKey(structs.NewRootKeyMeta()).MakeInactive()
+	key5.CreateTime = now - (15 * time.Minute).Nanoseconds()
+	must.NoError(t, store.UpsertRootKey(1500, key5, false))
 
-	// insert a "new" but inactive key
-	key5 := structs.NewRootKeyMeta()
-	key5.SetInactive()
-	require.NoError(t, store.UpsertRootKeyMeta(1500, key5, false))
+	// prepublishing key should never be GC'd no matter how old
+	key6 := structs.NewRootKey(structs.NewRootKeyMeta()).MakePrepublished(yesterday)
+	key6.CreateTime = yesterday
+	must.NoError(t, store.UpsertRootKey(1600, key6, false))
 
 	// run the core job
 	snap, err := store.Snapshot()
-	require.NoError(t, err)
+	must.NoError(t, err)
 	core := NewCoreScheduler(srv, snap)
 	eval := srv.coreJobEval(structs.CoreJobRootKeyRotateOrGC, 2000)
 	c := core.(*CoreScheduler)
-	require.NoError(t, c.rootKeyRotateOrGC(eval))
+	must.NoError(t, c.rootKeyGC(eval, time.Now()))
 
 	ws := memdb.NewWatchSet()
-	key, err := store.RootKeyMetaByID(ws, key0.KeyID)
-	require.NoError(t, err)
-	require.NotNil(t, key, "active key should not have been GCd")
+	key, err := store.RootKeyByID(ws, key0.KeyID)
+	must.NoError(t, err)
+	must.NotNil(t, key, must.Sprint("active key should not have been GCd"))
 
-	key, err = store.RootKeyMetaByID(ws, key1.KeyID)
-	require.NoError(t, err)
-	require.Nil(t, key, "old and unused inactive key should have been GCd")
+	key, err = store.RootKeyByID(ws, key1.KeyID)
+	must.NoError(t, err)
+	must.Nil(t, key, must.Sprint("old and unused inactive key should have been GCd"))
 
-	key, err = store.RootKeyMetaByID(ws, key2.KeyID)
-	require.NoError(t, err)
-	require.NotNil(t, key, "old key should not have been GCd if still in use")
+	key, err = store.RootKeyByID(ws, key2.KeyID)
+	must.NoError(t, err)
+	must.NotNil(t, key, must.Sprint("old key should not have been GCd if still in use"))
 
-	key, err = store.RootKeyMetaByID(ws, key3.KeyID)
-	require.NoError(t, err)
-	require.NotNil(t, key, "old key used to sign a live alloc should not have been GCd")
+	key, err = store.RootKeyByID(ws, key3.KeyID)
+	must.NoError(t, err)
+	must.NotNil(t, key, must.Sprint("old key used to sign a live alloc should not have been GCd"))
 
-	key, err = store.RootKeyMetaByID(ws, key4.KeyID)
-	require.NoError(t, err)
-	require.Nil(t, key, "old key used to sign a terminal alloc should have been GCd")
+	key, err = store.RootKeyByID(ws, key4.KeyID)
+	must.NoError(t, err)
+	must.Nil(t, key, must.Sprint("old key used to sign a terminal alloc should have been GCd"))
 
-	key, err = store.RootKeyMetaByID(ws, key5.KeyID)
-	require.NoError(t, err)
-	require.NotNil(t, key, "new key should not have been GCd")
+	key, err = store.RootKeyByID(ws, key5.KeyID)
+	must.NoError(t, err)
+	must.NotNil(t, key, must.Sprint("key newer than GC+rotation threshold should not have been GCd"))
 
+	key, err = store.RootKeyByID(ws, key6.KeyID)
+	must.NoError(t, err)
+	must.NotNil(t, key, must.Sprint("prepublishing key should not have been GCd"))
 }
 
 // TestCoreScheduler_VariablesRekey exercises variables rekeying
 func TestCoreScheduler_VariablesRekey(t *testing.T) {
 	ci.Parallel(t)
 
-	srv, cleanup := TestServer(t, nil)
+	srv, cleanup := TestServer(t, func(c *Config) {
+		c.NumSchedulers = 1
+	})
 	defer cleanup()
 	testutil.WaitForKeyring(t, srv.RPC, "global")
 
 	store := srv.fsm.State()
-	key0, err := store.GetActiveRootKeyMeta(nil)
-	require.NotNil(t, key0, "expected keyring to be bootstapped")
-	require.NoError(t, err)
+	key0, err := store.GetActiveRootKey(nil)
+	must.NotNil(t, key0, must.Sprint("expected keyring to be bootstapped"))
+	must.NoError(t, err)
 
 	for i := 0; i < 3; i++ {
 		req := &structs.VariablesApplyRequest{
@@ -2734,7 +2934,7 @@ func TestCoreScheduler_VariablesRekey(t *testing.T) {
 			WriteRequest: structs.WriteRequest{Region: srv.config.Region},
 		}
 		resp := &structs.VariablesApplyResponse{}
-		require.NoError(t, srv.RPC("Variables.Apply", req, resp))
+		must.NoError(t, srv.RPC("Variables.Apply", req, resp))
 	}
 
 	rotateReq := &structs.KeyringRotateRootKeyRequest{
@@ -2743,7 +2943,7 @@ func TestCoreScheduler_VariablesRekey(t *testing.T) {
 		},
 	}
 	var rotateResp structs.KeyringRotateRootKeyResponse
-	require.NoError(t, srv.RPC("Keyring.Rotate", rotateReq, &rotateResp))
+	must.NoError(t, srv.RPC("Keyring.Rotate", rotateReq, &rotateResp))
 
 	for i := 0; i < 3; i++ {
 		req := &structs.VariablesApplyRequest{
@@ -2752,31 +2952,29 @@ func TestCoreScheduler_VariablesRekey(t *testing.T) {
 			WriteRequest: structs.WriteRequest{Region: srv.config.Region},
 		}
 		resp := &structs.VariablesApplyResponse{}
-		require.NoError(t, srv.RPC("Variables.Apply", req, resp))
+		must.NoError(t, srv.RPC("Variables.Apply", req, resp))
 	}
 
 	rotateReq.Full = true
-	require.NoError(t, srv.RPC("Keyring.Rotate", rotateReq, &rotateResp))
+	must.NoError(t, srv.RPC("Keyring.Rotate", rotateReq, &rotateResp))
 	newKeyID := rotateResp.Key.KeyID
 
-	require.Eventually(t, func() bool {
-		ws := memdb.NewWatchSet()
-		iter, err := store.Variables(ws)
-		require.NoError(t, err)
-		for {
-			raw := iter.Next()
-			if raw == nil {
-				break
+	must.Wait(t, wait.InitialSuccess(
+		wait.Timeout(5*time.Second),
+		wait.Gap(100*time.Millisecond),
+		wait.BoolFunc(func() bool {
+			iter, _ := store.Variables(nil)
+			for raw := iter.Next(); raw != nil; raw = iter.Next() {
+				variable := raw.(*structs.VariableEncrypted)
+				if variable.KeyID != newKeyID {
+					return false
+				}
 			}
-			variable := raw.(*structs.VariableEncrypted)
-			if variable.KeyID != newKeyID {
-				return false
-			}
-		}
-		return true
-	}, time.Second*5, 100*time.Millisecond,
-		"variable rekey should be complete")
 
+			originalKey, _ := store.RootKeyByID(nil, key0.KeyID)
+			return originalKey.IsInactive()
+		}),
+	), must.Sprint("variable rekey should be complete"))
 }
 
 func TestCoreScheduler_FailLoop(t *testing.T) {

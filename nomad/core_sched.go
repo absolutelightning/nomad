@@ -99,7 +99,7 @@ func (c *CoreScheduler) forceGC(eval *structs.Evaluation) error {
 	if err := c.expiredACLTokenGC(eval, true); err != nil {
 		return err
 	}
-	if err := c.rootKeyGC(eval); err != nil {
+	if err := c.rootKeyGC(eval, time.Now()); err != nil {
 		return err
 	}
 	// Node GC must occur after the others to ensure the allocations are
@@ -156,6 +156,17 @@ OUTER:
 
 		// Job is eligible for garbage collection
 		if allEvalsGC {
+			// if any version of the job is tagged, it should be kept
+			versions, err := c.snap.JobVersionsByID(ws, job.Namespace, job.ID)
+			if err != nil {
+				c.logger.Error("job GC failed to get versions for job", "job", job.ID, "error", err)
+				continue
+			}
+			for _, v := range versions {
+				if v.VersionTag != nil {
+					continue OUTER
+				}
+			}
 			gcJob = append(gcJob, job)
 			gcAlloc = append(gcAlloc, jobAlloc...)
 			gcEval = append(gcEval, jobEval...)
@@ -899,44 +910,66 @@ func (c *CoreScheduler) expiredACLTokenGC(eval *structs.Evaluation, global bool)
 // rootKeyRotateOrGC is used to rotate or garbage collect root keys
 func (c *CoreScheduler) rootKeyRotateOrGC(eval *structs.Evaluation) error {
 
+	// migration sends updates to the leader so our view of state is no longer
+	// valid. we ack this core job and will pick up against at the next
+	// interval.
+	//
+	// COMPAT(1.12.0): remove this block in 1.12.0 LTS
+	stateChanged, err := c.rootKeyMigrate(eval)
+	if err != nil {
+		return err
+	}
+	if stateChanged {
+		return nil
+	}
+
 	// a rotation will be sent to the leader so our view of state
 	// is no longer valid. we ack this core job and will pick up
 	// the GC work on the next interval
-	wasRotated, err := c.rootKeyRotate(eval)
+	stateChanged, err = c.rootKeyRotate(eval, time.Now())
 	if err != nil {
 		return err
 	}
-	if wasRotated {
+	if stateChanged {
 		return nil
 	}
-	return c.rootKeyGC(eval)
+	return c.rootKeyGC(eval, time.Now())
 }
 
-func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation) error {
-
-	oldThreshold := c.getThreshold(eval, "root key",
-		"root_key_gc_threshold", c.srv.config.RootKeyGCThreshold)
+func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation, now time.Time) error {
 
 	ws := memdb.NewWatchSet()
-	iter, err := c.snap.RootKeyMetas(ws)
+	iter, err := c.snap.RootKeys(ws)
 	if err != nil {
 		return err
 	}
+
+	// the threshold is longer than we can support with the time table, and we
+	// never want to force-GC keys because that will orphan signed Workload
+	// Identities
+	rotationThreshold := now.Add(-1 *
+		(c.srv.config.RootKeyRotationThreshold + c.srv.config.RootKeyGCThreshold))
 
 	for {
 		raw := iter.Next()
 		if raw == nil {
 			break
 		}
-		keyMeta := raw.(*structs.RootKeyMeta)
-		if keyMeta.Active() || keyMeta.Rekeying() {
-			continue // never GC the active key or one we're rekeying
-		}
-		if keyMeta.CreateIndex > oldThreshold {
-			continue // don't GC recent keys
+		rootKey := raw.(*structs.RootKey)
+		if !rootKey.IsInactive() {
+			continue // never GC keys we're still using
 		}
 
-		inUse, err := c.snap.IsRootKeyMetaInUse(keyMeta.KeyID)
+		c.logger.Trace("checking inactive key eligibility for gc",
+			"create_time", rootKey.CreateTime, "threshold", rotationThreshold.UnixNano())
+
+		if rootKey.CreateTime > rotationThreshold.UnixNano() {
+			continue // don't GC keys with potentially live Workload Identities
+		}
+
+		// don't GC keys used to encrypt Variables or sign legacy non-expiring
+		// Workload Identities
+		inUse, err := c.snap.IsRootKeyInUse(rootKey.KeyID)
 		if err != nil {
 			return err
 		}
@@ -945,7 +978,7 @@ func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation) error {
 		}
 
 		req := &structs.KeyringDeleteRootKeyRequest{
-			KeyID: keyMeta.KeyID,
+			KeyID: rootKey.KeyID,
 			WriteRequest: structs.WriteRequest{
 				Region:    c.srv.config.Region,
 				AuthToken: eval.LeaderACL,
@@ -961,26 +994,142 @@ func (c *CoreScheduler) rootKeyGC(eval *structs.Evaluation) error {
 	return nil
 }
 
-// rootKeyRotate checks if the active key is old enough that we need
-// to kick off a rotation.
-func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation) (bool, error) {
-
-	rotationThreshold := c.getThreshold(eval, "root key",
-		"root_key_rotation_threshold", c.srv.config.RootKeyRotationThreshold)
+// rootKeyMigrate checks if the cluster is fully upgraded and migrates all the
+// legacy root key material to the new wrapped key format. It returns true if
+// any of the keys were migrated, because the caller should now treat the
+// snapshot as invalid.
+//
+// COMPAT(1.12.0): remove this function in 1.12.0 LTS
+func (c *CoreScheduler) rootKeyMigrate(eval *structs.Evaluation) (bool, error) {
+	if !ServersMeetMinimumVersion(
+		c.srv.serf.Members(), c.srv.Region(), minVersionKeyringInRaft, true) {
+		return false, nil
+	}
 
 	ws := memdb.NewWatchSet()
-	activeKey, err := c.snap.GetActiveRootKeyMeta(ws)
+	iter, err := c.snap.RootKeys(ws)
 	if err != nil {
 		return false, err
 	}
-	if activeKey == nil {
-		return false, nil // no active key
+	stateChanged := false
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		wrappedKeys := raw.(*structs.RootKey)
+		if len(wrappedKeys.WrappedKeys) > 0 {
+			continue // already migrated
+		}
+		rootKey, err := c.srv.encrypter.GetKey(wrappedKeys.KeyID)
+		if err != nil {
+			return stateChanged, err
+		}
+		req := &structs.KeyringUpdateRootKeyRequest{
+			RootKey: rootKey,
+			WriteRequest: structs.WriteRequest{
+				Region:    c.srv.config.Region,
+				AuthToken: eval.LeaderACL,
+			},
+		}
+
+		if err := c.srv.RPC("Keyring.Update",
+			req, &structs.KeyringUpdateRootKeyResponse{}); err != nil {
+			c.logger.Error("migrating legacy key material failed",
+				"error", err, "key_id", wrappedKeys.KeyID)
+			return false, err
+		}
+		stateChanged = true
 	}
-	if activeKey.CreateIndex >= rotationThreshold {
+
+	return stateChanged, nil
+}
+
+// rootKeyRotate checks if the active key is old enough that we need to kick off
+// a rotation. It prepublishes a key first and only promotes that prepublished
+// key to active once the rotation threshold has expired
+func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation, now time.Time) (bool, error) {
+	var (
+		activeKey       *structs.RootKey
+		prepublishedKey *structs.RootKey
+	)
+
+	ws := memdb.NewWatchSet()
+	iter, err := c.snap.RootKeys(ws)
+	if err != nil {
+		return false, err
+	}
+	for raw := iter.Next(); raw != nil; raw = iter.Next() {
+		key := raw.(*structs.RootKey)
+		switch key.State {
+		case structs.RootKeyStateActive:
+			activeKey = key
+		case structs.RootKeyStatePrepublished:
+			// multiple keys can be prepublished, so we only want to handle the
+			// very next one
+			if prepublishedKey == nil {
+				prepublishedKey = key
+			} else if prepublishedKey.PublishTime > key.PublishTime {
+				prepublishedKey = key
+			}
+		}
+	}
+
+	if prepublishedKey != nil {
+		c.logger.Trace("checking prepublished key eligibility for promotion",
+			"publish_time", prepublishedKey.PublishTime, "now", now.UnixNano())
+
+		if prepublishedKey.PublishTime > now.UnixNano() {
+			// at this point we have a key in a prepublished state but it's not
+			// ready to be made active, so we bail out. otherwise we'd kick off
+			// a new rotation every time we process this eval and we're past
+			// internval/2
+			return false, nil
+		}
+
+		rootKey, err := c.srv.encrypter.GetKey(prepublishedKey.KeyID)
+		if err != nil {
+			c.logger.Error("prepublished key does not exist in keyring", "error", err)
+			return false, nil
+		}
+		rootKey = rootKey.MakeActive()
+
+		req := &structs.KeyringUpdateRootKeyRequest{
+			RootKey: rootKey,
+			WriteRequest: structs.WriteRequest{
+				Region:    c.srv.config.Region,
+				AuthToken: eval.LeaderACL,
+			},
+		}
+
+		if err := c.srv.RPC("Keyring.Update",
+			req, &structs.KeyringUpdateRootKeyResponse{}); err != nil {
+			c.logger.Error("setting prepublished key active failed", "error", err)
+			return false, err
+		}
+		return true, nil
+	}
+
+	// There's no prepublished key so prepublish one now
+
+	if activeKey == nil {
+		c.logger.Warn("keyring has no active key: rotate keyring to repair")
+		return false, nil
+	}
+
+	// we rotate at half the rotation threshold because we want to prepublish a key
+	rotationThreshold := now.Add(-1 * c.srv.config.RootKeyRotationThreshold / 2)
+
+	c.logger.Trace("checking active key eligibility for rotation",
+		"create_time", activeKey.CreateTime, "threshold", rotationThreshold.UnixNano())
+
+	if activeKey.CreateTime > rotationThreshold.UnixNano() {
 		return false, nil // key is too new
 	}
 
+	// this eval may be processed up to RootKeyGCInterval after the halfway
+	// mark, so use the CreateTime of the previous key rather than the wall
+	// clock to set the publish time
+	publishTime := activeKey.CreateTime + c.srv.config.RootKeyRotationThreshold.Nanoseconds()
+
 	req := &structs.KeyringRotateRootKeyRequest{
+		PublishTime: publishTime,
 		WriteRequest: structs.WriteRequest{
 			Region:    c.srv.config.Region,
 			AuthToken: eval.LeaderACL,
@@ -1003,7 +1152,7 @@ func (c *CoreScheduler) rootKeyRotate(eval *structs.Evaluation) (bool, error) {
 func (c *CoreScheduler) variablesRekey(eval *structs.Evaluation) error {
 
 	ws := memdb.NewWatchSet()
-	iter, err := c.snap.RootKeyMetas(ws)
+	iter, err := c.snap.RootKeys(ws)
 	if err != nil {
 		return err
 	}
@@ -1013,11 +1162,11 @@ func (c *CoreScheduler) variablesRekey(eval *structs.Evaluation) error {
 		if raw == nil {
 			break
 		}
-		keyMeta := raw.(*structs.RootKeyMeta)
-		if !keyMeta.Rekeying() {
+		wrappedKeys := raw.(*structs.RootKey)
+		if !wrappedKeys.IsRekeying() {
 			continue
 		}
-		varIter, err := c.snap.GetVariablesByKeyID(ws, keyMeta.KeyID)
+		varIter, err := c.snap.GetVariablesByKeyID(ws, wrappedKeys.KeyID)
 		if err != nil {
 			return err
 		}
@@ -1026,6 +1175,23 @@ func (c *CoreScheduler) variablesRekey(eval *structs.Evaluation) error {
 			return err
 		}
 
+		rootKey, err := c.srv.encrypter.GetKey(wrappedKeys.KeyID)
+		if err != nil {
+			return fmt.Errorf("rotated key does not exist in keyring: %w", err)
+		}
+		rootKey = rootKey.MakeInactive()
+
+		req := &structs.KeyringUpdateRootKeyRequest{
+			RootKey: rootKey,
+			WriteRequest: structs.WriteRequest{
+				Region:    c.srv.config.Region,
+				AuthToken: eval.LeaderACL},
+		}
+		if err := c.srv.RPC("Keyring.Update",
+			req, &structs.KeyringUpdateRootKeyResponse{}); err != nil {
+			c.logger.Error("rekey complete but failed to mark key as inactive", "error", err)
+			return err
+		}
 	}
 
 	return nil

@@ -535,6 +535,50 @@ func TestStateStore_UpsertPlanResults_DeploymentUpdates(t *testing.T) {
 	}
 }
 
+func TestStateStore_UpsertPlanResults_AllocationResources(t *testing.T) {
+	ci.Parallel(t)
+
+	dev := &structs.RequestedDevice{Name: "nvidia/gpu/Tesla 60", Count: 1}
+	structuredDev := &structs.AllocatedDeviceResource{
+		Vendor:    "nvidia",
+		Type:      "gpu",
+		Name:      "Tesla 60",
+		DeviceIDs: []string{"GPU-0668fc92-f8d5-07f6-e3cc-c07d76f466a1"},
+	}
+
+	state := testStateStore(t)
+	alloc := mock.Alloc()
+	job := alloc.Job
+	alloc.Job = nil
+	alloc.Resources = nil
+	alloc.AllocatedResources.Tasks["web"].Devices = []*structs.AllocatedDeviceResource{structuredDev}
+
+	must.NoError(t, state.UpsertJob(structs.MsgTypeTestSetup, 999, nil, job))
+
+	eval := mock.Eval()
+	eval.JobID = job.ID
+
+	// Create an eval
+	must.NoError(t, state.UpsertEvals(structs.MsgTypeTestSetup, 1, []*structs.Evaluation{eval}))
+
+	// Create a plan result
+	res := structs.ApplyPlanResultsRequest{
+		AllocUpdateRequest: structs.AllocUpdateRequest{
+			Alloc: []*structs.Allocation{alloc},
+			Job:   job,
+		},
+		EvalID: eval.ID,
+	}
+
+	must.NoError(t, state.UpsertPlanResults(structs.MsgTypeTestSetup, 1000, &res))
+
+	out, err := state.AllocByID(nil, alloc.ID)
+	must.NoError(t, err)
+	must.Eq(t, alloc, out)
+
+	must.Eq(t, alloc.Resources.Devices[0], dev)
+}
+
 func TestStateStore_UpsertDeployment(t *testing.T) {
 	ci.Parallel(t)
 
@@ -2855,6 +2899,154 @@ func TestStateStore_DeleteJobTxn_BatchDeletes(t *testing.T) {
 	index, err := state.Index("jobs")
 	require.NoError(t, err)
 	require.Equal(t, deletionIndex, index)
+}
+
+// TestStatestore_JobVersionTag tests that job versions which are tagged
+// do not count against the configured server.job_tracked_versions count,
+// do not get deleted when new versions are created,
+// and *do* get deleted immediately when its tag is removed.
+func TestStatestore_JobVersionTag(t *testing.T) {
+	ci.Parallel(t)
+
+	state := testStateStore(t)
+	// tagged versions should be excluded from this limit
+	state.config.JobTrackedVersions = 5
+
+	job := mock.MinJob()
+	job.Stable = true
+
+	// helpers for readability
+	upsertJob := func(t *testing.T) {
+		t.Helper()
+		must.NoError(t, state.UpsertJob(structs.MsgTypeTestSetup, nextIndex(state), nil, job.Copy()))
+	}
+
+	applyTag := func(t *testing.T, version uint64) {
+		t.Helper()
+		name := fmt.Sprintf("v%d", version)
+		desc := fmt.Sprintf("version %d", version)
+		req := &structs.JobApplyTagRequest{
+			JobID: job.ID,
+			Name:  name,
+			Tag: &structs.JobVersionTag{
+				Name:        name,
+				Description: desc,
+			},
+			Version: version,
+		}
+		must.NoError(t, state.UpdateJobVersionTag(nextIndex(state), job.Namespace, req))
+
+		// confirm
+		got, err := state.JobVersionByTagName(nil, job.Namespace, job.ID, name)
+		must.NoError(t, err)
+		must.Eq(t, version, got.Version)
+		must.Eq(t, name, got.VersionTag.Name)
+		must.Eq(t, desc, got.VersionTag.Description)
+	}
+	unsetTag := func(t *testing.T, name string) {
+		t.Helper()
+		req := &structs.JobApplyTagRequest{
+			JobID: job.ID,
+			Name:  name,
+			Tag:   nil, // this triggers unset
+		}
+		must.NoError(t, state.UpdateJobVersionTag(nextIndex(state), job.Namespace, req))
+	}
+
+	assertVersions := func(t *testing.T, expect []uint64) {
+		t.Helper()
+		jobs, err := state.JobVersionsByID(nil, job.Namespace, job.ID)
+		must.NoError(t, err)
+		vs := make([]uint64, len(jobs))
+		for i, j := range jobs {
+			vs[i] = j.Version
+		}
+		must.Eq(t, expect, vs)
+	}
+
+	// we want to end up with JobTrackedVersions (5) versions,
+	// 0-2 tagged and 3-4 untagged, but also interleave the tagging
+	// to be somewhat true to normal behavior in reality.
+	{
+		// upsert 3 jobs
+		for range 3 {
+			upsertJob(t)
+		}
+		assertVersions(t, []uint64{2, 1, 0})
+
+		// tag 2 of them
+		applyTag(t, 1)
+		applyTag(t, 2)
+		// nothing should change
+		assertVersions(t, []uint64{2, 1, 0})
+
+		// add 3 more, up to JobTrackedVersions (5) + 1 (6)
+		for range 3 {
+			upsertJob(t)
+		}
+		assertVersions(t, []uint64{5, 4, 3, 2, 1, 0})
+
+		// tag one more
+		applyTag(t, 3)
+		// again nothing should change
+		assertVersions(t, []uint64{5, 4, 3, 2, 1, 0})
+	}
+
+	// removing a tag at this point should leave the version in place,
+	// because we still have room within JobTrackedVersions
+	{
+		unsetTag(t, "v3")
+		assertVersions(t, []uint64{5, 4, 3, 2, 1, 0})
+	}
+
+	// adding more versions should replace 0,3-5
+	// and leave 1-2 in place because they are tagged
+	{
+		for range 10 {
+			upsertJob(t)
+		}
+		assertVersions(t, []uint64{15, 14, 13, 12, 11, 2, 1})
+	}
+
+	// untagging version 1 now should delete it immediately,
+	// since we now have more than JobTrackedVersions
+	{
+		unsetTag(t, "v1")
+		assertVersions(t, []uint64{15, 14, 13, 12, 11, 2})
+	}
+
+	// test some error conditions
+	{
+		// job does not exist
+		err := state.UpdateJobVersionTag(nextIndex(state), job.Namespace, &structs.JobApplyTagRequest{
+			JobID:   "non-existent-job",
+			Tag:     &structs.JobVersionTag{Name: "tag name"},
+			Version: 0,
+		})
+		must.ErrorContains(t, err, `job "non-existent-job" version 0 not found`)
+
+		// version does not exist
+		err = state.UpdateJobVersionTag(nextIndex(state), job.Namespace, &structs.JobApplyTagRequest{
+			JobID:   job.ID,
+			Tag:     &structs.JobVersionTag{Name: "tag name"},
+			Version: 999,
+		})
+		must.ErrorContains(t, err, fmt.Sprintf("job %q version 999 not found", job.ID))
+
+		// tag name already exists
+		err = state.UpdateJobVersionTag(nextIndex(state), job.Namespace, &structs.JobApplyTagRequest{
+			JobID:   job.ID,
+			Tag:     &structs.JobVersionTag{Name: "v2"},
+			Version: 10,
+		})
+		must.ErrorContains(t, err, fmt.Sprintf(`"v2" already exists on a different version of job %q`, job.ID))
+	}
+
+	// deleting all versions should also delete tagged versions
+	txn := state.db.WriteTxn(nextIndex(state))
+	must.NoError(t, state.deleteJobVersions(nextIndex(state), job, txn))
+	must.NoError(t, txn.Commit())
+	assertVersions(t, []uint64{})
 }
 
 func TestStateStore_DeleteJob_MultipleVersions(t *testing.T) {
@@ -10636,9 +10828,10 @@ func TestStateStore_UpsertScalingEvent(t *testing.T) {
 	job := mock.Job()
 	groupName := job.TaskGroups[0].Name
 
-	newEvent := structs.NewScalingEvent("message 1").SetMeta(map[string]interface{}{
+	newEvent := structs.NewScalingEvent("message 1")
+	newEvent.Meta = map[string]interface{}{
 		"a": 1,
-	})
+	}
 
 	wsAll := memdb.NewWatchSet()
 	all, err := state.ScalingEvents(wsAll)
@@ -10709,10 +10902,11 @@ func TestStateStore_UpsertScalingEvent_LimitAndOrder(t *testing.T) {
 
 	index := uint64(1000)
 	for i := 1; i <= structs.JobTrackedScalingEvents+10; i++ {
-		newEvent := structs.NewScalingEvent("").SetMeta(map[string]interface{}{
+		newEvent := structs.NewScalingEvent("")
+		newEvent.Meta = map[string]interface{}{
 			"i":     i,
 			"group": group1,
-		})
+		}
 		err := state.UpsertScalingEvent(index, &structs.ScalingEventRequest{
 			Namespace:    namespace,
 			JobID:        jobID,
@@ -10722,10 +10916,11 @@ func TestStateStore_UpsertScalingEvent_LimitAndOrder(t *testing.T) {
 		index++
 		require.NoError(err)
 
-		newEvent = structs.NewScalingEvent("").SetMeta(map[string]interface{}{
+		newEvent = structs.NewScalingEvent("")
+		newEvent.Meta = map[string]interface{}{
 			"i":     i,
 			"group": group2,
-		})
+		}
 		err = state.UpsertScalingEvent(index, &structs.ScalingEventRequest{
 			Namespace:    namespace,
 			JobID:        jobID,
@@ -10762,75 +10957,6 @@ func TestStateStore_UpsertScalingEvent_LimitAndOrder(t *testing.T) {
 		actualEvents = append(actualEvents, event.Meta["i"].(int))
 	}
 	require.Equal(expectedEvents, actualEvents)
-}
-
-func TestStateStore_RootKeyMetaData_CRUD(t *testing.T) {
-	ci.Parallel(t)
-	store := testStateStore(t)
-	index, err := store.LatestIndex()
-	require.NoError(t, err)
-
-	// create 3 default keys, one of which is active
-	keyIDs := []string{}
-	for i := 0; i < 3; i++ {
-		key := structs.NewRootKeyMeta()
-		keyIDs = append(keyIDs, key.KeyID)
-		if i == 0 {
-			key.SetActive()
-		}
-		index++
-		require.NoError(t, store.UpsertRootKeyMeta(index, key, false))
-	}
-
-	// retrieve the active key
-	activeKey, err := store.GetActiveRootKeyMeta(nil)
-	require.NoError(t, err)
-	require.NotNil(t, activeKey)
-
-	// update an inactive key to active and verify the rotation
-	inactiveKey, err := store.RootKeyMetaByID(nil, keyIDs[1])
-	require.NoError(t, err)
-	require.NotNil(t, inactiveKey)
-	oldCreateIndex := inactiveKey.CreateIndex
-	newlyActiveKey := inactiveKey.Copy()
-	newlyActiveKey.SetActive()
-	index++
-	require.NoError(t, store.UpsertRootKeyMeta(index, newlyActiveKey, false))
-
-	iter, err := store.RootKeyMetas(nil)
-	require.NoError(t, err)
-	for {
-		raw := iter.Next()
-		if raw == nil {
-			break
-		}
-		key := raw.(*structs.RootKeyMeta)
-		if key.KeyID == newlyActiveKey.KeyID {
-			require.True(t, key.Active(), "expected updated key to be active")
-			require.Equal(t, oldCreateIndex, key.CreateIndex)
-		} else {
-			require.False(t, key.Active(), "expected other keys to be inactive")
-		}
-	}
-
-	// delete the active key and verify it's been deleted
-	index++
-	require.NoError(t, store.DeleteRootKeyMeta(index, keyIDs[1]))
-
-	iter, err = store.RootKeyMetas(nil)
-	require.NoError(t, err)
-	var found int
-	for {
-		raw := iter.Next()
-		if raw == nil {
-			break
-		}
-		key := raw.(*structs.RootKeyMeta)
-		require.NotEqual(t, keyIDs[1], key.KeyID)
-		require.False(t, key.Active(), "expected remaining keys to be inactive")
-		found++
-	}
-	require.Equal(t, 2, found, "expected only 2 keys remaining")
 }
 
 func TestStateStore_Abandon(t *testing.T) {

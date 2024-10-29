@@ -92,7 +92,7 @@ var (
 type Interface interface {
 	AllocDirFS
 
-	NewTaskDir(string) *TaskDir
+	NewTaskDir(*structs.Task) *TaskDir
 	AllocDirPath() string
 	ShareDirPath() string
 	GetTaskDir(string) *TaskDir
@@ -173,12 +173,17 @@ func NewAllocDir(logger hclog.Logger, clientAllocDir, clientMountsDir, allocID s
 }
 
 // NewTaskDir creates a new TaskDir and adds it to the AllocDirs TaskDirs map.
-func (d *AllocDir) NewTaskDir(name string) *TaskDir {
+func (d *AllocDir) NewTaskDir(task *structs.Task) *TaskDir {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	td := d.newTaskDir(name)
-	d.TaskDirs[name] = td
+	secretsSize := 0
+	if task.Resources != nil {
+		secretsSize = task.Resources.SecretsMB
+	}
+
+	td := d.newTaskDir(task.Name, secretsSize)
+	d.TaskDirs[task.Name] = td
 	return td
 }
 
@@ -466,11 +471,11 @@ func (d *AllocDir) ReadAt(path string, offset int64) (io.ReadCloser, error) {
 	// Check if it is trying to read into a secret directory
 	d.mu.RLock()
 	for _, dir := range d.TaskDirs {
-		if filepath.HasPrefix(p, dir.SecretsDir) {
+		if caseInsensitiveHasPrefix(p, dir.SecretsDir) {
 			d.mu.RUnlock()
 			return nil, fmt.Errorf("Reading secret file prohibited: %s", path)
 		}
-		if filepath.HasPrefix(p, dir.PrivateDir) {
+		if caseInsensitiveHasPrefix(p, dir.PrivateDir) {
 			d.mu.RUnlock()
 			return nil, fmt.Errorf("Reading private file prohibited: %s", path)
 		}
@@ -485,6 +490,11 @@ func (d *AllocDir) ReadAt(path string, offset int64) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("can't seek to offset %q: %w", offset, err)
 	}
 	return f, nil
+}
+
+// CaseInsensitiveHasPrefix checks if the prefix is a case-insensitive prefix.
+func caseInsensitiveHasPrefix(s, prefix string) bool {
+	return strings.HasPrefix(strings.ToLower(s), strings.ToLower(prefix))
 }
 
 // BlockUntilExists blocks until the passed file relative the allocation
@@ -717,9 +727,9 @@ func allocMkdirAll(path string, perms os.FileMode) error {
 // allocMakeSecretsDir creates a directory for sensitive items such as secrets.
 // When possible it uses a tmpfs or some other method to prevent it from
 // persisting to actual disk.
-func allocMakeSecretsDir(path string, perms os.FileMode) error {
+func allocMakeSecretsDir(path string, size int, perms os.FileMode) error {
 	// Create the private directory
-	if err := createSecretDir(path); err != nil {
+	if err := createSecretDir(path, size); err != nil {
 		return err
 	}
 	if err := dropDirPermissions(path, perms); err != nil {

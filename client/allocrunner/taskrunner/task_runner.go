@@ -443,6 +443,11 @@ func NewTaskRunner(config *Config) (*TaskRunner, error) {
 	if !ok {
 		return nil, fmt.Errorf("no task resources found on allocation")
 	}
+
+	// we had to allocate the tmpfs with the memory to get correct scheduling
+	// and tracking on the node, but now that we're creating the task driver
+	// config we only care about the memory without the secrets.
+	tres.Memory.MemoryMB -= int64(tr.task.Resources.SecretsMB)
 	tr.taskResources = tres
 
 	// Build the restart tracker.
@@ -503,6 +508,20 @@ func (tr *TaskRunner) initLabels() {
 			Name:  "namespace",
 			Value: tr.alloc.Namespace,
 		},
+	}
+
+	if tr.clientConfig.IncludeAllocMetadataInMetrics {
+		combined := alloc.Job.CombinedTaskMeta(alloc.TaskGroup, tr.taskName)
+		for meta, metaValue := range combined {
+			if len(tr.clientConfig.AllowedMetadataKeysInMetrics) > 0 && !slices.Contains(tr.clientConfig.AllowedMetadataKeysInMetrics, meta) {
+				continue
+			}
+
+			tr.baseLabels = append(tr.baseLabels, metrics.Label{
+				Name:  strings.ReplaceAll(meta, "-", "_"),
+				Value: metaValue,
+			})
+		}
 	}
 
 	if tr.alloc.Job.ParentID != "" {

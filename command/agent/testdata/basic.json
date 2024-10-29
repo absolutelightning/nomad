@@ -76,6 +76,7 @@
       "alloc_mounts_dir": "/tmp/mounts",
       "bridge_network_name": "custom_bridge_name",
       "bridge_network_subnet": "custom_bridge_subnet",
+      "bridge_network_subnet_ipv6": "custom_bridge_subnet_ipv6",
       "chroot_env": [
         {
           "/opt/myapp/bin": "/bin",
@@ -389,7 +390,6 @@
       "rpc_upgrade_mode": true,
       "tls_cipher_suites": "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
       "tls_min_version": "tls12",
-      "tls_prefer_server_cipher_suites": true,
       "verify_https_client": true,
       "verify_server_hostname": true
     }
@@ -421,6 +421,8 @@
     }
   ],
   "reporting": {
+    "address": "http://localhost:8080",
+    "export_interval": "15m",
     "license": {
       "enabled": "true"
     }

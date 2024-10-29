@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strings"
 	"time"
 
 	log "github.com/hashicorp/go-hclog"
@@ -503,6 +504,21 @@ func (c *Config) VaultIdentityConfig(cluster string) *structs.WorkloadIdentity {
 	return workloadIdentityFromConfig(conf.DefaultIdentity)
 }
 
+// GetVaultForIdentity reverses VaultIdentityConfig and finds the Vault
+// configuration that goes with a particular workload identity intended for
+// Vault
+func (c *Config) GetVaultForIdentity(wi *structs.WorkloadIdentity) *config.VaultConfig {
+	if !wi.IsVault() {
+		return nil
+	}
+	cluster := strings.TrimPrefix(wi.Name, structs.WorkloadIdentityVaultPrefix)
+	if cluster == "" {
+		return nil
+	}
+	conf := c.VaultConfigs[cluster]
+	return conf
+}
+
 func (c *Config) GetDefaultConsul() *config.ConsulConfig {
 	return c.ConsulConfigs[structs.ConsulDefaultCluster]
 }
@@ -528,6 +544,9 @@ func workloadIdentityFromConfig(widConfig *config.WorkloadIdentityConfig) *struc
 	}
 	if widConfig.File != nil {
 		wid.File = *widConfig.File
+	}
+	if widConfig.Filepath != "" {
+		wid.Filepath = widConfig.Filepath
 	}
 	if widConfig.TTL != nil {
 		wid.TTL = *widConfig.TTL

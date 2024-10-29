@@ -67,12 +67,6 @@ type templateHook struct {
 	templateManager *template.TaskTemplateManager
 	managerLock     sync.Mutex
 
-	// driverHandle is the task driver executor used by the template manager to
-	// run scripts when the template change mode is set to script.
-	//
-	// Must obtain a managerLock before changing. It may be nil.
-	driverHandle ti.ScriptExecutor
-
 	// consulNamespace is the current Consul namespace
 	consulNamespace string
 
@@ -192,27 +186,6 @@ func (h *templateHook) Prestart(ctx context.Context, req *interfaces.TaskPrestar
 	return nil
 }
 
-func (h *templateHook) Poststart(_ context.Context, req *interfaces.TaskPoststartRequest, resp *interfaces.TaskPoststartResponse) error {
-	h.managerLock.Lock()
-	defer h.managerLock.Unlock()
-
-	if h.templateManager == nil {
-		return nil
-	}
-
-	if req.DriverExec != nil {
-		h.driverHandle = req.DriverExec
-		h.templateManager.SetDriverHandle(h.driverHandle)
-	} else {
-		for _, tmpl := range h.config.templates {
-			if tmpl.ChangeMode == structs.TemplateChangeModeScript {
-				return fmt.Errorf("template has change mode set to 'script' but the driver it uses does not provide exec capability")
-			}
-		}
-	}
-	return nil
-}
-
 func (h *templateHook) newManager() (unblock chan struct{}, err error) {
 	unblock = make(chan struct{})
 
@@ -254,9 +227,6 @@ func (h *templateHook) newManager() (unblock chan struct{}, err error) {
 	}
 
 	h.templateManager = m
-	if h.driverHandle != nil {
-		h.templateManager.SetDriverHandle(h.driverHandle)
-	}
 	return unblock, nil
 }
 

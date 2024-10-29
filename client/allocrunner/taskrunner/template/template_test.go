@@ -59,16 +59,6 @@ const (
 	TestTaskName = "test-task"
 )
 
-// mockExecutor implements script executor interface
-type mockExecutor struct {
-	DesiredExit int
-	DesiredErr  error
-}
-
-func (m *mockExecutor) Exec(timeout time.Duration, cmd string, args []string) ([]byte, int, error) {
-	return []byte{}, m.DesiredExit, m.DesiredErr
-}
-
 // testHarness is used to test the TaskTemplateManager by spinning up
 // Consul/Vault as needed
 type testHarness struct {
@@ -1146,6 +1136,7 @@ func TestTaskTemplateManager_ScriptExecution(t *testing.T) {
 	key2 := "bar"
 	content1_1 := "cat"
 	content1_2 := "dog"
+
 	t1 := &structs.Template{
 		EmbeddedTmpl: `
 FOO={{key "bam"}}
@@ -1175,10 +1166,9 @@ BAR={{key "bar"}}
 		Envvars: true,
 	}
 
-	me := mockExecutor{DesiredExit: 0, DesiredErr: nil}
 	harness := newTestHarness(t, []*structs.Template{t1, t2}, true, false)
+	harness.mockHooks.SetupExecTest(0, nil)
 	harness.start(t)
-	harness.manager.SetDriverHandle(&me)
 	defer harness.stop()
 
 	// Ensure no unblock
@@ -1261,10 +1251,9 @@ BAR={{key "bar"}}
 		Envvars: true,
 	}
 
-	me := mockExecutor{DesiredExit: 1, DesiredErr: fmt.Errorf("Script failed")}
 	harness := newTestHarness(t, []*structs.Template{t1, t2}, true, false)
+	harness.mockHooks.SetupExecTest(1, fmt.Errorf("Script failed"))
 	harness.start(t)
-	harness.manager.SetDriverHandle(&me)
 	defer harness.stop()
 
 	// Ensure no unblock
@@ -1341,10 +1330,9 @@ COMMON={{key "common"}}
 		templateScript,
 	}
 
-	me := mockExecutor{DesiredExit: 0, DesiredErr: nil}
 	harness := newTestHarness(t, templates, true, false)
+	harness.mockHooks.SetupExecTest(0, nil)
 	harness.start(t)
-	harness.manager.SetDriverHandle(&me)
 	defer harness.stop()
 
 	// Ensure no unblock
@@ -1832,7 +1820,7 @@ func TestTaskTemplateManager_Escapes(t *testing.T) {
 	task := alloc.Job.TaskGroups[0].Tasks[0]
 	logger := testlog.HCLogger(t)
 	allocDir := allocdir.NewAllocDir(logger, clientConf.AllocDir, clientConf.AllocMountsDir, alloc.ID)
-	taskDir := allocDir.NewTaskDir(task.Name)
+	taskDir := allocDir.NewTaskDir(task)
 
 	containerEnv := func() *taskenv.Builder {
 		// To emulate a Docker or exec tasks we must copy the

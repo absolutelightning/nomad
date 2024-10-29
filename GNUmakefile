@@ -42,9 +42,11 @@ endif
 # tag corresponding to latest release we maintain backward compatibility with
 PROTO_COMPARE_TAG ?= v1.0.3$(if $(findstring ent,$(GO_TAGS)),+ent,)
 
-# LAST_RELEASE is the git sha of the latest release corresponding to this branch. main should have the latest
-# published release, and release branches should point to the latest published release in the X.Y release line.
-LAST_RELEASE ?= v1.8.2
+# LAST_RELEASE is used for generating the changelog. It is the last released GA
+# or backport version, without the leading "v". main should have the latest
+# published release here, and release branches should point to the latest
+# published release in their X.Y release line.
+LAST_RELEASE ?= 1.8.4
 
 default: help
 
@@ -135,13 +137,13 @@ deps:  ## Install build and development dependencies
 	go install github.com/bufbuild/buf/cmd/buf@v0.36.0
 	go install github.com/hashicorp/go-changelog/cmd/changelog-build@latest
 	go install golang.org/x/tools/cmd/stringer@v0.18.0
-	go install github.com/hashicorp/hc-install/cmd/hc-install@v0.6.1
+	go install github.com/hashicorp/hc-install/cmd/hc-install@v0.9.0
 	go install github.com/shoenig/go-modtool@v0.2.0
 
 .PHONY: lint-deps
 lint-deps: ## Install linter dependencies
 	@echo "==> Updating linter dependencies..."
-	go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.56.2
+	go install github.com/golangci/golangci-lint/cmd/golangci-lint@v1.61.0
 	go install github.com/client9/misspell/cmd/misspell@v0.3.4
 	go install github.com/hashicorp/go-hclog/hclogvet@v0.2.0
 
@@ -223,7 +225,7 @@ proto: ## Generate protobuf bindings
 	@buf --config tools/buf/buf.yaml --template tools/buf/buf.gen.yaml generate
 
 changelog: ## Generate changelog from entries
-	@changelog-build -last-release $(LAST_RELEASE) -this-release HEAD \
+	@changelog-build -last-release v$(LAST_RELEASE) -this-release HEAD \
 		-entries-dir .changelog/ -changelog-template ./.changelog/changelog.tmpl -note-template ./.changelog/note.tmpl
 
 ## We skip the terraform directory as there are templated hcl configurations
@@ -443,7 +445,6 @@ copywriteheaders:
 	cd api && $(CURDIR)/scripts/copywrite-exceptions.sh
 	cd drivers/shared && $(CURDIR)/scripts/copywrite-exceptions.sh
 	cd plugins && $(CURDIR)/scripts/copywrite-exceptions.sh
-	cd jobspec && $(CURDIR)/scripts/copywrite-exceptions.sh
 	cd jobspec2 && $(CURDIR)/scripts/copywrite-exceptions.sh
 	cd demo && $(CURDIR)/scripts/copywrite-exceptions.sh
 

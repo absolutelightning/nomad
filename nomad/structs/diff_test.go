@@ -4616,6 +4616,12 @@ func TestTaskGroupDiff(t *testing.T) {
 									},
 									{
 										Type: DiffTypeDeleted,
+										Name: "IgnoreCollision",
+										Old:  "false",
+										New:  "",
+									},
+									{
+										Type: DiffTypeDeleted,
 										Name: "Label",
 										Old:  "foo",
 										New:  "",
@@ -6053,6 +6059,7 @@ func TestTaskDiff(t *testing.T) {
 						},
 						GetterMode:   "dir",
 						RelativeDest: "bar",
+						Chown:        false,
 					},
 				},
 			},
@@ -6076,6 +6083,7 @@ func TestTaskDiff(t *testing.T) {
 						},
 						GetterMode:   "file",
 						RelativeDest: "bam",
+						Chown:        true,
 					},
 				},
 			},
@@ -6098,6 +6106,12 @@ func TestTaskDiff(t *testing.T) {
 						Type: DiffTypeAdded,
 						Name: "Artifact",
 						Fields: []*FieldDiff{
+							{
+								Type: DiffTypeAdded,
+								Name: "Chown",
+								Old:  "",
+								New:  "true",
+							},
 							{
 								Type: DiffTypeAdded,
 								Name: "GetterHeaders[User-Agent]",
@@ -6148,11 +6162,16 @@ func TestTaskDiff(t *testing.T) {
 						Fields: []*FieldDiff{
 							{
 								Type: DiffTypeDeleted,
+								Name: "Chown",
+								Old:  "false",
+								New:  "",
+							},
+							{
+								Type: DiffTypeDeleted,
 								Name: "GetterHeaders[User]",
 								Old:  "user1",
 								New:  "",
 							},
-
 							{
 								Type: DiffTypeDeleted,
 								Name: "GetterInsecure",
@@ -6199,9 +6218,10 @@ func TestTaskDiff(t *testing.T) {
 			},
 			New: &Task{
 				Resources: &Resources{
-					CPU:      200,
-					MemoryMB: 200,
-					DiskMB:   200,
+					CPU:       200,
+					MemoryMB:  200,
+					DiskMB:    200,
+					SecretsMB: 10,
 				},
 			},
 			Expected: &TaskDiff{
@@ -6228,6 +6248,12 @@ func TestTaskDiff(t *testing.T) {
 								Name: "MemoryMB",
 								Old:  "100",
 								New:  "200",
+							},
+							{
+								Type: DiffTypeEdited,
+								Name: "SecretsMB",
+								Old:  "0",
+								New:  "10",
 							},
 						},
 					},
@@ -6291,6 +6317,12 @@ func TestTaskDiff(t *testing.T) {
 							{
 								Type: DiffTypeNone,
 								Name: "MemoryMaxMB",
+								Old:  "0",
+								New:  "0",
+							},
+							{
+								Type: DiffTypeNone,
+								Name: "SecretsMB",
 								Old:  "0",
 								New:  "0",
 							},
@@ -6397,6 +6429,12 @@ func TestTaskDiff(t *testing.T) {
 								Old:  "200",
 								New:  "300",
 							},
+							{
+								Type: DiffTypeNone,
+								Name: "SecretsMB",
+								Old:  "0",
+								New:  "0",
+							},
 						},
 					},
 				},
@@ -6469,6 +6507,12 @@ func TestTaskDiff(t *testing.T) {
 										Fields: []*FieldDiff{
 											{
 												Type: DiffTypeAdded,
+												Name: "IgnoreCollision",
+												Old:  "",
+												New:  "false",
+											},
+											{
+												Type: DiffTypeAdded,
 												Name: "Label",
 												Old:  "",
 												New:  "foo",
@@ -6515,6 +6559,12 @@ func TestTaskDiff(t *testing.T) {
 										Type: DiffTypeDeleted,
 										Name: "Static Port",
 										Fields: []*FieldDiff{
+											{
+												Type: DiffTypeDeleted,
+												Name: "IgnoreCollision",
+												Old:  "false",
+												New:  "",
+											},
 											{
 												Type: DiffTypeDeleted,
 												Name: "Label",
@@ -6746,6 +6796,12 @@ func TestTaskDiff(t *testing.T) {
 								Old:  "0",
 								New:  "0",
 							},
+							{
+								Type: DiffTypeNone,
+								Name: "SecretsMB",
+								Old:  "0",
+								New:  "0",
+							},
 						},
 						Objects: []*ObjectDiff{
 							{
@@ -6818,9 +6874,7 @@ func TestTaskDiff(t *testing.T) {
 						"a": 1,
 						"b": 2,
 					},
-					"boom": &Port{
-						Label: "boom_port",
-					},
+					"boom": []string{"boom_port"},
 				},
 			},
 			New: &Task{
@@ -6832,9 +6886,7 @@ func TestTaskDiff(t *testing.T) {
 						"a": 1,
 						"b": 2,
 					},
-					"boom": &Port{
-						Label: "boom_port",
-					},
+					"boom": []string{"boom_port"},
 				},
 			},
 			Expected: &TaskDiff{
@@ -6852,9 +6904,7 @@ func TestTaskDiff(t *testing.T) {
 						"a": 1,
 						"b": 2,
 					},
-					"boom": &Port{
-						Label: "boom_port",
-					},
+					"boom": []string{"boom_port"},
 				},
 			},
 			New: &Task{
@@ -6866,9 +6916,7 @@ func TestTaskDiff(t *testing.T) {
 						"b": 3,
 						"c": 4,
 					},
-					"boom": &Port{
-						Label: "boom_port2",
-					},
+					"boom": []string{"boom_port2"},
 				},
 			},
 			Expected: &TaskDiff{
@@ -6910,7 +6958,7 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeEdited,
-								Name: "boom.Label",
+								Name: "boom[0]",
 								Old:  "boom_port",
 								New:  "boom_port2",
 							},
@@ -6937,9 +6985,7 @@ func TestTaskDiff(t *testing.T) {
 						"a": 1,
 						"b": 2,
 					},
-					"boom": &Port{
-						Label: "boom_port",
-					},
+					"boom": []string{"boom_port"},
 				},
 			},
 			New: &Task{
@@ -6951,9 +6997,7 @@ func TestTaskDiff(t *testing.T) {
 						"a": 1,
 						"b": 2,
 					},
-					"boom": &Port{
-						Label: "boom_port",
-					},
+					"boom": []string{"boom_port"},
 				},
 			},
 			Expected: &TaskDiff{
@@ -7001,27 +7045,9 @@ func TestTaskDiff(t *testing.T) {
 							},
 							{
 								Type: DiffTypeNone,
-								Name: "boom.HostNetwork",
-								Old:  "",
-								New:  "",
-							},
-							{
-								Type: DiffTypeNone,
-								Name: "boom.Label",
+								Name: "boom[0]",
 								Old:  "boom_port",
 								New:  "boom_port",
-							},
-							{
-								Type: DiffTypeNone,
-								Name: "boom.To",
-								Old:  "0",
-								New:  "0",
-							},
-							{
-								Type: DiffTypeNone,
-								Name: "boom.Value",
-								Old:  "0",
-								New:  "0",
 							},
 							{
 								Type: DiffTypeEdited,
@@ -9898,6 +9924,10 @@ func TestServicesDiff(t *testing.T) {
 					EnableTagOverride: true,
 					Tags:              []string{"prod"},
 					CanaryTags:        []string{"canary"},
+					Weights: &ServiceWeights{
+						Passing: 1,
+						Warning: 1,
+					},
 				},
 			},
 			New: []*Service{
@@ -9909,6 +9939,10 @@ func TestServicesDiff(t *testing.T) {
 					EnableTagOverride: false,
 					Tags:              []string{"prod", "dev"},
 					CanaryTags:        []string{"qa"},
+					Weights: &ServiceWeights{
+						Passing: 5,
+						Warning: 1,
+					},
 				},
 			},
 			Expected: []*ObjectDiff{
@@ -10000,6 +10034,24 @@ func TestServicesDiff(t *testing.T) {
 									Name: "Tags",
 									Old:  "prod",
 									New:  "prod",
+								},
+							},
+						},
+						{
+							Type: DiffTypeEdited,
+							Name: "Weights",
+							Fields: []*FieldDiff{
+								{
+									Type: DiffTypeEdited,
+									Name: "Passing",
+									Old:  "1",
+									New:  "5",
+								},
+								{
+									Type: DiffTypeNone,
+									Name: "Warning",
+									Old:  "1",
+									New:  "1",
 								},
 							},
 						},

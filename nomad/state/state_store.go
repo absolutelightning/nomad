@@ -17,7 +17,7 @@ import (
 	"github.com/hashicorp/go-hclog"
 	"github.com/hashicorp/go-memdb"
 	"github.com/hashicorp/go-multierror"
-	"github.com/hashicorp/go-set/v2"
+	"github.com/hashicorp/go-set/v3"
 	"github.com/hashicorp/nomad/helper"
 	"github.com/hashicorp/nomad/helper/pointer"
 	"github.com/hashicorp/nomad/lib/lang"
@@ -490,6 +490,24 @@ func addComputedAllocAttrs(allocs []*structs.Allocation, job *structs.Job) {
 			alloc.Resources.Add(task)
 		}
 
+		// While we still rely on alloc.Resources field for quotas, we have to add
+		// device info from AllocatedResources to alloc.Resources
+		for _, resources := range alloc.AllocatedResources.Tasks {
+			for _, d := range resources.Devices {
+				name := d.ID().String()
+				count := len(d.DeviceIDs)
+
+				if count > 0 {
+					if alloc.Resources.Devices == nil {
+						alloc.Resources.Devices = make(structs.ResourceDevices, 0)
+					}
+					alloc.Resources.Devices = append(
+						alloc.Resources.Devices, &structs.RequestedDevice{Name: name, Count: uint64(count)},
+					)
+				}
+			}
+		}
+
 		// Add the shared resources
 		alloc.Resources.Add(alloc.SharedResources)
 	}
@@ -875,7 +893,7 @@ func (s *StateStore) UpsertScalingEvent(index uint64, req *structs.ScalingEventR
 
 	var jobEvents *structs.JobScalingEvents
 	if existing != nil {
-		jobEvents = existing.(*structs.JobScalingEvents)
+		jobEvents = existing.(*structs.JobScalingEvents).Copy()
 	} else {
 		jobEvents = &structs.JobScalingEvents{
 			Namespace:     req.Namespace,
@@ -2076,7 +2094,7 @@ func (s *StateStore) deleteJobSubmission(job *structs.Job, txn *txn) error {
 	}
 
 	// now delete the submissions we found associated with the job
-	for _, sub := range remove.Slice() {
+	for sub := range remove.Items() {
 		err := txn.Delete("job_submission", sub)
 		if err != nil {
 			return err
@@ -2142,8 +2160,9 @@ func (s *StateStore) upsertJobVersion(index uint64, job *structs.Job, txn *txn) 
 		return fmt.Errorf("index update failed: %v", err)
 	}
 
-	// Get all the historic jobs for this ID
-	all, err := s.jobVersionByID(txn, nil, job.Namespace, job.ID)
+	// Get all the historic jobs for this ID, except those with a VersionTag,
+	// as they should always be kept. They are in Version order, high to low.
+	all, err := s.jobVersionByID(txn, nil, job.Namespace, job.ID, false)
 	if err != nil {
 		return fmt.Errorf("failed to look up job versions for %q: %v", job.ID, err)
 	}
@@ -2170,7 +2189,7 @@ func (s *StateStore) upsertJobVersion(index uint64, job *structs.Job, txn *txn) 
 		all[max-1], all[max] = all[max], all[max-1]
 	}
 
-	// Delete the job outside of the set that are being kept.
+	// Delete the oldest one
 	d := all[max]
 	if err := txn.Delete("job_version", d); err != nil {
 		return fmt.Errorf("failed to delete job %v (%d) from job_version", d.ID, d.Version)
@@ -2281,17 +2300,32 @@ func (s *StateStore) jobsByIDPrefixAllNamespaces(ws memdb.WatchSet, prefix strin
 	return wrap, nil
 }
 
-// JobVersionsByID returns all the tracked versions of a job.
+// JobVersionsByID returns all the tracked versions of a job, sorted in from highest version to lowest.
 func (s *StateStore) JobVersionsByID(ws memdb.WatchSet, namespace, id string) ([]*structs.Job, error) {
 	txn := s.db.ReadTxn()
 
-	return s.jobVersionByID(txn, ws, namespace, id)
+	return s.jobVersionByID(txn, ws, namespace, id, true)
+}
+
+// JobVersionByTagName returns a Job if it has a Tag with the passed name
+func (s *StateStore) JobVersionByTagName(ws memdb.WatchSet, namespace, id string, tagName string) (*structs.Job, error) {
+	// First get all versions of the job
+	versions, err := s.JobVersionsByID(ws, namespace, id)
+	if err != nil {
+		return nil, err
+	}
+	for _, j := range versions {
+		if j.VersionTag != nil && j.VersionTag.Name == tagName {
+			return j, nil
+		}
+	}
+	return nil, nil
 }
 
 // jobVersionByID is the underlying implementation for retrieving all tracked
 // versions of a job and is called under an existing transaction. A watch set
 // can optionally be passed in to add the job histories to the watch set.
-func (s *StateStore) jobVersionByID(txn *txn, ws memdb.WatchSet, namespace, id string) ([]*structs.Job, error) {
+func (s *StateStore) jobVersionByID(txn *txn, ws memdb.WatchSet, namespace, id string, includeTagged bool) ([]*structs.Job, error) {
 	// Get all the historic jobs for this ID
 	iter, err := txn.Get("job_version", "id_prefix", namespace, id)
 	if err != nil {
@@ -2310,6 +2344,10 @@ func (s *StateStore) jobVersionByID(txn *txn, ws memdb.WatchSet, namespace, id s
 		// Ensure the ID is an exact match
 		j := raw.(*structs.Job)
 		if j.ID != id {
+			continue
+		}
+
+		if !includeTagged && j.VersionTag != nil {
 			continue
 		}
 
@@ -3923,7 +3961,7 @@ func (s *StateStore) UpdateAllocsFromClient(msgType structs.MessageType, index u
 	}
 
 	// Update the index of when nodes last updated their allocs.
-	for _, nodeID := range nodeIDs.Slice() {
+	for nodeID := range nodeIDs.Items() {
 		if err := s.updateClientAllocUpdateIndex(txn, index, nodeID); err != nil {
 			return fmt.Errorf("node update failed: %v", err)
 		}
@@ -4883,6 +4921,95 @@ func (s *StateStore) updateJobStabilityImpl(index uint64, namespace, jobID strin
 	copy := job.Copy()
 	copy.Stable = stable
 	return s.upsertJobImpl(index, nil, copy, true, txn)
+}
+
+func (s *StateStore) UpdateJobVersionTag(index uint64, namespace string, req *structs.JobApplyTagRequest) error {
+	jobID := req.JobID
+	jobVersion := req.Version
+	tag := req.Tag
+	name := req.Name
+
+	txn := s.db.WriteTxn(index)
+	defer txn.Abort()
+
+	// if no tag is present, this is a tag removal operation.
+	if tag == nil {
+		if err := s.unsetJobVersionTagImpl(index, namespace, jobID, name, txn); err != nil {
+			return err
+		}
+	} else {
+		if err := s.updateJobVersionTagImpl(index, namespace, jobID, jobVersion, tag, txn); err != nil {
+			return err
+		}
+	}
+
+	return txn.Commit()
+}
+
+func (s *StateStore) updateJobVersionTagImpl(index uint64, namespace, jobID string, jobVersion uint64, tag *structs.JobVersionTag, txn *txn) error {
+	// Note: could use JobByIDAndVersion to get the specific version we want here,
+	// but then we'd have to make a second lookup to make sure we're not applying a duplicate tag name
+	versions, err := s.JobVersionsByID(nil, namespace, jobID)
+	if err != nil {
+		return err
+	}
+
+	var job *structs.Job
+
+	for _, version := range versions {
+		// Allow for a tag to be updated (new description, for example) but otherwise don't allow a same-tagname to a different version.
+		if version.VersionTag != nil && version.VersionTag.Name == tag.Name && version.Version != jobVersion {
+			return fmt.Errorf("tag %q already exists on a different version of job %q", tag.Name, jobID)
+		}
+		if version.Version == jobVersion {
+			job = version
+		}
+	}
+
+	if job == nil {
+		return fmt.Errorf("job %q version %d not found", jobID, jobVersion)
+	}
+
+	versionCopy := job.Copy()
+	versionCopy.VersionTag = tag
+	versionCopy.ModifyIndex = index
+
+	latestJob, err := s.JobByID(nil, namespace, jobID)
+	if err != nil {
+		return err
+	}
+	if versionCopy.Version == latestJob.Version {
+		if err := txn.Insert("jobs", versionCopy); err != nil {
+			return err
+		}
+	}
+
+	return s.upsertJobVersion(index, versionCopy, txn)
+}
+
+func (s *StateStore) unsetJobVersionTagImpl(index uint64, namespace, jobID string, name string, txn *txn) error {
+	job, err := s.JobVersionByTagName(nil, namespace, jobID, name)
+	if err != nil {
+		return err
+	}
+	if job == nil {
+		return fmt.Errorf("tag %q not found on job %q", name, jobID)
+	}
+
+	versionCopy := job.Copy()
+	versionCopy.VersionTag = nil
+	versionCopy.ModifyIndex = index
+	latestJob, err := s.JobByID(nil, namespace, jobID)
+	if err != nil {
+		return err
+	}
+	if versionCopy.Version == latestJob.Version {
+		if err := txn.Insert("jobs", versionCopy); err != nil {
+			return err
+		}
+	}
+
+	return s.upsertJobVersion(index, versionCopy, txn)
 }
 
 // UpdateDeploymentPromotion is used to promote canaries in a deployment and
@@ -7321,189 +7448,4 @@ func (s *StateSnapshot) DenormalizeAllocationDiffSlice(allocDiffs []*structs.All
 
 func getPreemptedAllocDesiredDescription(preemptedByAllocID string) string {
 	return fmt.Sprintf("Preempted by alloc ID %v", preemptedByAllocID)
-}
-
-// UpsertRootKeyMeta saves root key meta or updates it in-place.
-func (s *StateStore) UpsertRootKeyMeta(index uint64, rootKeyMeta *structs.RootKeyMeta, rekey bool) error {
-	txn := s.db.WriteTxn(index)
-	defer txn.Abort()
-
-	// get any existing key for updating
-	raw, err := txn.First(TableRootKeyMeta, indexID, rootKeyMeta.KeyID)
-	if err != nil {
-		return fmt.Errorf("root key metadata lookup failed: %v", err)
-	}
-
-	isRotation := false
-
-	if raw != nil {
-		existing := raw.(*structs.RootKeyMeta)
-		rootKeyMeta.CreateIndex = existing.CreateIndex
-		rootKeyMeta.CreateTime = existing.CreateTime
-		isRotation = !existing.Active() && rootKeyMeta.Active()
-	} else {
-		rootKeyMeta.CreateIndex = index
-		isRotation = rootKeyMeta.Active()
-	}
-	rootKeyMeta.ModifyIndex = index
-
-	if rekey && !isRotation {
-		return fmt.Errorf("cannot rekey without setting the new key active")
-	}
-
-	// if the upsert is for a newly-active key, we need to set all the
-	// other keys as inactive in the same transaction.
-	if isRotation {
-		iter, err := txn.Get(TableRootKeyMeta, indexID)
-		if err != nil {
-			return err
-		}
-		for {
-			raw := iter.Next()
-			if raw == nil {
-				break
-			}
-			key := raw.(*structs.RootKeyMeta)
-			modified := false
-
-			switch key.State {
-			case structs.RootKeyStateInactive:
-				if rekey {
-					key.SetRekeying()
-					modified = true
-				}
-			case structs.RootKeyStateActive:
-				if rekey {
-					key.SetRekeying()
-				} else {
-					key.SetInactive()
-				}
-				modified = true
-			case structs.RootKeyStateRekeying, structs.RootKeyStateDeprecated:
-				// nothing to do
-			}
-
-			if modified {
-				key.ModifyIndex = index
-				if err := txn.Insert(TableRootKeyMeta, key); err != nil {
-					return err
-				}
-			}
-
-		}
-	}
-
-	if err := txn.Insert(TableRootKeyMeta, rootKeyMeta); err != nil {
-		return err
-	}
-
-	// update the indexes table
-	if err := txn.Insert("index", &IndexEntry{TableRootKeyMeta, index}); err != nil {
-		return fmt.Errorf("index update failed: %v", err)
-	}
-	return txn.Commit()
-}
-
-// DeleteRootKeyMeta deletes a single root key, or returns an error if
-// it doesn't exist.
-func (s *StateStore) DeleteRootKeyMeta(index uint64, keyID string) error {
-	txn := s.db.WriteTxn(index)
-	defer txn.Abort()
-
-	// find the old key
-	existing, err := txn.First(TableRootKeyMeta, indexID, keyID)
-	if err != nil {
-		return fmt.Errorf("root key metadata lookup failed: %v", err)
-	}
-	if existing == nil {
-		return fmt.Errorf("root key metadata not found")
-	}
-	if err := txn.Delete(TableRootKeyMeta, existing); err != nil {
-		return fmt.Errorf("root key metadata delete failed: %v", err)
-	}
-
-	// update the indexes table
-	if err := txn.Insert("index", &IndexEntry{TableRootKeyMeta, index}); err != nil {
-		return fmt.Errorf("index update failed: %v", err)
-	}
-
-	return txn.Commit()
-}
-
-// RootKeyMetas returns an iterator over all root key metadata
-func (s *StateStore) RootKeyMetas(ws memdb.WatchSet) (memdb.ResultIterator, error) {
-	txn := s.db.ReadTxn()
-
-	iter, err := txn.Get(TableRootKeyMeta, indexID)
-	if err != nil {
-		return nil, err
-	}
-
-	ws.Add(iter.WatchCh())
-	return iter, nil
-}
-
-// RootKeyMetaByID returns a specific root key meta
-func (s *StateStore) RootKeyMetaByID(ws memdb.WatchSet, id string) (*structs.RootKeyMeta, error) {
-	txn := s.db.ReadTxn()
-
-	watchCh, raw, err := txn.FirstWatch(TableRootKeyMeta, indexID, id)
-	if err != nil {
-		return nil, fmt.Errorf("root key metadata lookup failed: %v", err)
-	}
-	ws.Add(watchCh)
-
-	if raw != nil {
-		return raw.(*structs.RootKeyMeta), nil
-	}
-	return nil, nil
-}
-
-// GetActiveRootKeyMeta returns the metadata for the currently active root key
-func (s *StateStore) GetActiveRootKeyMeta(ws memdb.WatchSet) (*structs.RootKeyMeta, error) {
-	txn := s.db.ReadTxn()
-
-	iter, err := txn.Get(TableRootKeyMeta, indexID)
-	if err != nil {
-		return nil, err
-	}
-	ws.Add(iter.WatchCh())
-
-	for {
-		raw := iter.Next()
-		if raw == nil {
-			break
-		}
-		key := raw.(*structs.RootKeyMeta)
-		if key.Active() {
-			return key, nil
-		}
-	}
-	return nil, nil
-}
-
-// IsRootKeyMetaInUse determines whether a key has been used to sign a workload
-// identity for a live allocation or encrypt any variables
-func (s *StateStore) IsRootKeyMetaInUse(keyID string) (bool, error) {
-	txn := s.db.ReadTxn()
-
-	iter, err := txn.Get(TableAllocs, indexSigningKey, keyID, true)
-	if err != nil {
-		return false, err
-	}
-	alloc := iter.Next()
-	if alloc != nil {
-		return true, nil
-	}
-
-	iter, err = txn.Get(TableVariables, indexKeyID, keyID)
-	if err != nil {
-		return false, err
-	}
-	variable := iter.Next()
-	if variable != nil {
-		return true, nil
-	}
-
-	return false, nil
 }
