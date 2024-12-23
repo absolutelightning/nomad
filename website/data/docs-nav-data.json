@@ -53,27 +53,27 @@
   {
     "title": "Release Notes",
     "routes": [
-       {
-         "title": "Overview",
-         "path": "release-notes"
-       },
-       {
-         "title": "Nomad",
-         "routes": [
-           {
-             "title": "Upcoming",
-             "path": "release-notes/nomad/upcoming"
-           },
-           {
-             "title": "v1.8.x",
-             "path": "release-notes/nomad/v1_8_x"
-           },
-           {
+      {
+        "title": "Overview",
+        "path": "release-notes"
+      },
+      {
+        "title": "Nomad",
+        "routes": [
+          {
+            "title": "Upcoming",
+            "path": "release-notes/nomad/upcoming"
+          },
+          {
+            "title": "v1.8.x",
+            "path": "release-notes/nomad/v1_8_x"
+          },
+          {
             "title": "v1.9.x",
             "path": "release-notes/nomad/v1_9_x"
           }
-         ]
-       }
+        ]
+      }
     ]
   },
   {
@@ -131,7 +131,16 @@
       },
       {
         "title": "Architecture",
-        "path": "concepts/architecture"
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "concepts/architecture"
+          },
+          {
+            "title": "Federation",
+            "path": "concepts/architecture/federation"
+          }
+        ]
       },
       {
         "title": "CPU",
@@ -1755,6 +1764,10 @@
         "path": "job-specification/device"
       },
       {
+        "title": "disconnect",
+        "path": "job-specification/disconnect"
+      },
+      {
         "title": "dispatch_payload",
         "path": "job-specification/dispatch_payload"
       },
@@ -1769,10 +1782,6 @@
       {
         "title": "expose",
         "path": "job-specification/expose"
-      },
-      {
-        "title": "disconnect",
-        "path": "job-specification/disconnect"
       },
       {
         "title": "gateway",
@@ -2386,6 +2395,19 @@
         "path": "operations/key-management"
       },
       {
+        "title": "Federation",
+        "routes": [
+          {
+            "title": "Overview",
+            "path": "operations/federation"
+          },
+          {
+            "title": "Failure",
+            "path": "operations/federation/failure"
+          }
+        ]
+      },
+      {
         "title": "Considerations for Stateful Workloads",
         "path": "operations/stateful-workloads"
       },
@@ -2396,6 +2418,10 @@
       {
         "title": "Federate AWS Access with Workload Identity",
         "path": "operations/aws-oidc-provider"
+      },
+      {
+        "title": "IPv6 Support",
+        "path": "operations/ipv6-support"
       }
     ]
   },

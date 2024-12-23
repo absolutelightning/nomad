@@ -1357,6 +1357,8 @@ func (s *Server) setupRpcServer(server *rpc.Server, ctx *RPCContext) {
 	_ = server.Register(NewStatusEndpoint(s, ctx))
 	_ = server.Register(NewSystemEndpoint(s, ctx))
 	_ = server.Register(NewVariablesEndpoint(s, ctx, s.encrypter))
+	_ = server.Register(NewHostVolumeEndpoint(s, ctx))
+	_ = server.Register(NewClientHostVolumeEndpoint(s, ctx))
 
 	// Register non-streaming
 
@@ -1388,6 +1390,7 @@ func (s *Server) setupRaft() error {
 		EventBufferSize:    s.config.EventBufferSize,
 		JobTrackedVersions: s.config.JobTrackedVersions,
 	}
+
 	var err error
 	s.fsm, err = NewFSM(fsmConfig)
 	if err != nil {

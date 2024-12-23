@@ -1,3 +1,39 @@
+## 1.9.3 (November 11, 2024)
+
+BUG FIXES:
+
+* fix: handles consul template re-renders on client restart [[GH-24399](https://github.com/hashicorp/nomad/issues/24399)]
+* fsm: Fix bug in snapshot restore that could partially wipe state [[GH-24412](https://github.com/hashicorp/nomad/issues/24412)]
+
+## 1.9.2 (November 08, 2024)
+
+SECURITY:
+
+* csi: Fixed a bug where a user with csi-write-volume permissions to one namespace can create volumes in another namespace (CVE-2024-10975) [[GH-24396](https://github.com/hashicorp/nomad/issues/24396)]
+
+IMPROVEMENTS:
+
+* api: new parameterized dispatch endpoint sends raw HTTP request body as Payload [[GH-24312](https://github.com/hashicorp/nomad/issues/24312)]
+* connect: Able to accept go-sockaddr address for consul grpc address [[GH-24280](https://github.com/hashicorp/nomad/issues/24280)]
+* consul: add support for service weight [[GH-24186](https://github.com/hashicorp/nomad/issues/24186)]
+* drivers: Add work_dir config to exec/rawexec/java drivers for setting the working directory of processes in a task [[GH-24249](https://github.com/hashicorp/nomad/issues/24249)]
+* drivers: Move executor process out of task cgroup after task starts on cgroups v1 [[GH-24340](https://github.com/hashicorp/nomad/issues/24340)]
+* drivers: add posibility to restrict user and group for exec and rawexec [[GH-20073](https://github.com/hashicorp/nomad/issues/20073)]
+* fingerprint gce: fingerprint preemptibility [[GH-24169](https://github.com/hashicorp/nomad/issues/24169)]
+* getter: Added option to chown artifact(s) to task user [[GH-24157](https://github.com/hashicorp/nomad/issues/24157)]
+* ui: Indicates prestart/poststart tasks by running/failed/pending status [[GH-24133](https://github.com/hashicorp/nomad/issues/24133)]
+* ui: Show region in header when only one region exists, and set it immediately upon logging in with a token [[GH-24320](https://github.com/hashicorp/nomad/issues/24320)]
+* ui: When your token expires, upon signing back in, redirect to your original route [[GH-24374](https://github.com/hashicorp/nomad/issues/24374)]
+
+BUG FIXES:
+
+* cli: Corrected an ordering mistake in job tag unset help text [[GH-24272](https://github.com/hashicorp/nomad/issues/24272)]
+* connect: add validation to ensure that connect native services specify a port [[GH-24329](https://github.com/hashicorp/nomad/issues/24329)]
+* deps: Fixed a bug where restarting Nomad could cause an unrelated process with the same PID as a failed executor to be killed [[GH-24265](https://github.com/hashicorp/nomad/issues/24265)]
+* keyring: Fixed a panic on server startup when decrypting AEAD key data with empty RSA block [[GH-24383](https://github.com/hashicorp/nomad/issues/24383)]
+* scheduler: fixed a bug where resource calculation did not account correctly for poststart tasks [[GH-24297](https://github.com/hashicorp/nomad/issues/24297)]
+* state: Fixed setting GC threshold to more than 72hrs being ignored [[GH-24112](https://github.com/hashicorp/nomad/issues/24112)]
+
 ## 1.9.1 (October 21, 2024)
 
 IMPROVEMENTS:
@@ -57,6 +93,18 @@ BUG FIXES:
 * task: adds node.pool attribute to interpretable values in task env [[GH-24052](https://github.com/hashicorp/nomad/issues/24052)]
 * template: Fixed a panic on client restart when using change_mode=script [[GH-24057](https://github.com/hashicorp/nomad/issues/24057)]
 * ui: Fixes an issue where variables paths would not let namespaced users write variables unless they also had wildcard namespace variable write permissions [[GH-24073](https://github.com/hashicorp/nomad/issues/24073)]
+
+## 1.8.7 Enterprise (November 8, 2024)
+
+SECURITY:
+
+* csi: Fixed a bug where a user with csi-write-volume permissions to one namespace can create volumes in another namespace (CVE-2024-10975) [[GH-24396](https://github.com/hashicorp/nomad/issues/24396)]
+
+BUG FIXES:
+
+* connect: add validation to ensure that connect native services specify a port [[GH-24329](https://github.com/hashicorp/nomad/issues/24329)]
+* keyring: Fixed a panic on server startup when decrypting AEAD key data with empty RSA block [[GH-24383](https://github.com/hashicorp/nomad/issues/24383)]
+* scheduler: fixed a bug where resource calculation did not account correctly for poststart tasks [[GH-24297](https://github.com/hashicorp/nomad/issues/24297)]
 
 ## 1.8.6 Enterprise(October 21, 2024)
 
@@ -197,7 +245,7 @@ BUG FIXES:
 * server: Fixed a bug where expiring heartbeats for garbage collected nodes could panic the server [[GH-23383](https://github.com/hashicorp/nomad/issues/23383)]
 * template: Fix template rendering on Windows [[GH-23432](https://github.com/hashicorp/nomad/issues/23432)]
 * ui: Actions run from jobs with explicit name properties now work from the web UI [[GH-23553](https://github.com/hashicorp/nomad/issues/23553)]
-* ui: Dont show keyboard nav hints when taking a screenshot [[GH-23365](https://github.com/hashicorp/nomad/issues/23365)]
+* ui: Don't show keyboard nav hints when taking a screenshot [[GH-23365](https://github.com/hashicorp/nomad/issues/23365)]
 * ui: Fix an issue where a remotely purged job would prevent redirect from taking place in the web UI [[GH-23492](https://github.com/hashicorp/nomad/issues/23492)]
 * ui: Fix an issue where access to Job Templates in the UI was restricted to variable.write access [[GH-23458](https://github.com/hashicorp/nomad/issues/23458)]
 * ui: Fix the Upload Jobspec button on the Run Job page [[GH-23548](https://github.com/hashicorp/nomad/issues/23548)]
@@ -293,6 +341,18 @@ BUG FIXES:
 * ui: Fixed an issue where keynav would not trigger evaluation sidebar expand [[GH-20047](https://github.com/hashicorp/nomad/issues/20047)]
 * ui: Show the namespace in the web UI exec command hint [[GH-20218](https://github.com/hashicorp/nomad/issues/20218)]
 * windows: Fixed a regression where scanning task processes was inefficient [[GH-20619](https://github.com/hashicorp/nomad/issues/20619)]
+
+## 1.7.15 (November 8, 2024)
+
+SECURITY:
+
+* csi: Fixed a bug where a user with csi-write-volume permissions to one namespace can create volumes in another namespace (CVE-2024-10975) [[GH-24396](https://github.com/hashicorp/nomad/issues/24396)]
+
+BUG FIXES:
+
+* connect: add validation to ensure that connect native services specify a port [[GH-24329](https://github.com/hashicorp/nomad/issues/24329)]
+* deps: Fixed a bug where restarting Nomad could cause an unrelated process with the same PID as a failed executor to be killed [[GH-24265](https://github.com/hashicorp/nomad/issues/24265)]
+* scheduler: fixed a bug where resource calculation did not account correctly for poststart tasks [[GH-24297](https://github.com/hashicorp/nomad/issues/24297)]
 
 ## 1.7.14 Enterprise (October 21, 2024)
 
@@ -585,7 +645,7 @@ IMPROVEMENTS:
 
 * audit (Enterprise): Added ACL token role links to audit log auth objects [[GH-19415](https://github.com/hashicorp/nomad/issues/19415)]
 * ui: Added a new example template with Task Actions [[GH-19153](https://github.com/hashicorp/nomad/issues/19153)]
-* ui: dont allow new jobspec download until template is populated, and remove group count from jobs index [[GH-19377](https://github.com/hashicorp/nomad/issues/19377)]
+* ui: Don't allow new jobspec download until template is populated, and remove group count from jobs index [[GH-19377](https://github.com/hashicorp/nomad/issues/19377)]
 * ui: make the exec window look nicer on mobile screens [[GH-19332](https://github.com/hashicorp/nomad/issues/19332)]
 
 BUG FIXES:
@@ -660,7 +720,7 @@ IMPROVEMENTS:
 * ui: for system and sysbatch jobs, now show client name on hover in job panel [[GH-19051](https://github.com/hashicorp/nomad/issues/19051)]
 * ui: nicer comment styles in UI example jobs [[GH-19037](https://github.com/hashicorp/nomad/issues/19037)]
 * ui: show plan output warnings alongside placement failures and dry-run info when running a job through the web ui [[GH-19225](https://github.com/hashicorp/nomad/issues/19225)]
-* ui: simplify presentation of task event times (10m2.230948s bceomes 10m2s etc.) [[GH-18595](https://github.com/hashicorp/nomad/issues/18595)]
+* ui: simplify presentation of task event times (10m2.230948s becomes 10m2s etc.) [[GH-18595](https://github.com/hashicorp/nomad/issues/18595)]
 * vars: Added a locking feature for Nomad Variables [[GH-18520](https://github.com/hashicorp/nomad/issues/18520)]
 
 DEPRECATIONS:

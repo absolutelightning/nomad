@@ -132,6 +132,10 @@ const (
 	NamespaceUpsertRequestType                   MessageType = 64
 	NamespaceDeleteRequestType                   MessageType = 65
 
+	// MessageTypes 66-74 are in Nomad Enterprise
+	HostVolumeRegisterRequestType MessageType = 75
+	HostVolumeDeleteRequestType   MessageType = 76
+
 	// NOTE: MessageTypes are shared between CE and ENT. If you need to add a
 	// new type, check that ENT is not already using that value.
 )
@@ -1381,6 +1385,9 @@ type DeploymentPromoteRequest struct {
 	// Groups is used to set the promotion status per task group
 	Groups []string
 
+	// PromotedAt is the timestamp stored as Unix nano
+	PromotedAt int64
+
 	WriteRequest
 }
 
@@ -2169,7 +2176,7 @@ type Node struct {
 	StatusDescription string
 
 	// StatusUpdatedAt is the time stamp at which the state of the node was
-	// updated
+	// updated, stored as Unix (no nano seconds!)
 	StatusUpdatedAt int64
 
 	// Events is the most recent set of events generated for the node,
@@ -3853,31 +3860,45 @@ func (a *AllocatedResources) Comparable() *ComparableResources {
 		Shared: a.Shared,
 	}
 
-	prestartSidecarTasks := &AllocatedTaskResources{}
-	prestartEphemeralTasks := &AllocatedTaskResources{}
-	main := &AllocatedTaskResources{}
-	poststopTasks := &AllocatedTaskResources{}
+	// The lifecycle in which a task could run
+	prestartLifecycle := &AllocatedTaskResources{}
+	mainLifecycle := &AllocatedTaskResources{}
+	stopLifecycle := &AllocatedTaskResources{}
 
-	for taskName, r := range a.Tasks {
-		lc := a.TaskLifecycles[taskName]
-		if lc == nil {
-			main.Add(r)
-		} else if lc.Hook == TaskLifecycleHookPrestart {
-			if lc.Sidecar {
-				prestartSidecarTasks.Add(r)
+	for taskName, taskResources := range a.Tasks {
+		taskLifecycle := a.TaskLifecycles[taskName]
+		fungibleTaskResources := taskResources.Copy()
+
+		// Reserved cores (and their respective bandwidth) are not fungible,
+		// hence we should always include it as part of the Flattened resources.
+		if len(fungibleTaskResources.Cpu.ReservedCores) > 0 {
+			c.Flattened.Cpu.Add(&fungibleTaskResources.Cpu)
+			fungibleTaskResources.Cpu = AllocatedCpuResources{}
+		}
+
+		if taskLifecycle == nil {
+			mainLifecycle.Add(fungibleTaskResources)
+		} else if taskLifecycle.Hook == TaskLifecycleHookPrestart {
+			if taskLifecycle.Sidecar {
+				// These tasks span both the prestart and main lifecycle
+				prestartLifecycle.Add(fungibleTaskResources)
+				mainLifecycle.Add(fungibleTaskResources)
 			} else {
-				prestartEphemeralTasks.Add(r)
+				prestartLifecycle.Add(fungibleTaskResources)
 			}
-		} else if lc.Hook == TaskLifecycleHookPoststop {
-			poststopTasks.Add(r)
+		} else if taskLifecycle.Hook == TaskLifecycleHookPoststart {
+			mainLifecycle.Add(fungibleTaskResources)
+		} else if taskLifecycle.Hook == TaskLifecycleHookPoststop {
+			stopLifecycle.Add(fungibleTaskResources)
 		}
 	}
 
-	// update this loop to account for lifecycle hook
-	prestartEphemeralTasks.Max(main)
-	prestartEphemeralTasks.Max(poststopTasks)
-	prestartSidecarTasks.Add(prestartEphemeralTasks)
-	c.Flattened.Add(prestartSidecarTasks)
+	// Update the main lifecycle to reflect the largest fungible resource set
+	mainLifecycle.Max(prestartLifecycle)
+	mainLifecycle.Max(stopLifecycle)
+
+	// Add the fungible resources
+	c.Flattened.Add(mainLifecycle)
 
 	// Add network resources that are at the task group level
 	for _, network := range a.Shared.Networks {
@@ -7046,10 +7067,6 @@ func (tg *TaskGroup) Canonicalize(job *Job) {
 	// Set a default ephemeral disk object if the user has not requested for one
 	if tg.EphemeralDisk == nil {
 		tg.EphemeralDisk = DefaultEphemeralDisk()
-	}
-
-	if job.Type == JobTypeSystem && tg.Count == 0 {
-		tg.Count = 1
 	}
 
 	if tg.Scaling != nil {
@@ -10638,10 +10655,14 @@ type Deployment struct {
 
 	CreateIndex uint64
 	ModifyIndex uint64
+
+	// Creation and modification times, stored as UnixNano
+	CreateTime int64
+	ModifyTime int64
 }
 
 // NewDeployment creates a new deployment given the job.
-func NewDeployment(job *Job, evalPriority int) *Deployment {
+func NewDeployment(job *Job, evalPriority int, now int64) *Deployment {
 	return &Deployment{
 		ID:                 uuid.Generate(),
 		Namespace:          job.Namespace,
@@ -10655,6 +10676,7 @@ func NewDeployment(job *Job, evalPriority int) *Deployment {
 		StatusDescription:  DeploymentStatusDescriptionRunning,
 		TaskGroups:         make(map[string]*DeploymentState, len(job.TaskGroups)),
 		EvalPriority:       evalPriority,
+		CreateTime:         now,
 	}
 }
 
@@ -10834,6 +10856,9 @@ type DeploymentStatusUpdate struct {
 
 	// StatusDescription is the new status description of the deployment.
 	StatusDescription string
+
+	// UpdatedAt is the time of the update, stored as UnixNano
+	UpdatedAt int64
 }
 
 // RescheduleTracker encapsulates previous reschedule events
@@ -11089,6 +11114,13 @@ type Allocation struct {
 	// AllocatedResources is the total resources allocated for the task group.
 	AllocatedResources *AllocatedResources
 
+	// HostVolumeIDs is a list of host volume IDs that this allocation
+	// has claimed.
+	HostVolumeIDs []string
+
+	// CSIVolumeIDs is a list of CSI volume IDs that this allocation has claimed.
+	CSIVolumeIDs []string
+
 	// Metrics associated with this allocation
 	Metrics *AllocMetric
 
@@ -11163,10 +11195,10 @@ type Allocation struct {
 	AllocModifyIndex uint64
 
 	// CreateTime is the time the allocation has finished scheduling and been
-	// verified by the plan applier.
+	// verified by the plan applier, stored as UnixNano.
 	CreateTime int64
 
-	// ModifyTime is the time the allocation was last updated.
+	// ModifyTime is the time the allocation was last updated stored as UnixNano.
 	ModifyTime int64
 }
 
@@ -11176,6 +11208,23 @@ func (a *Allocation) GetID() string {
 		return ""
 	}
 	return a.ID
+}
+
+// Sanitize returns a copy of the allocation with the SignedIdentities field
+// removed. This is useful for returning allocations to clients where the
+// SignedIdentities field is not needed.
+func (a *Allocation) Sanitize() *Allocation {
+	if a == nil {
+		return nil
+	}
+
+	if a.SignedIdentities == nil {
+		return a
+	}
+
+	clean := a.Copy()
+	clean.SignedIdentities = nil
+	return clean
 }
 
 // GetNamespace implements the NamespaceGetter interface, required for
@@ -12552,6 +12601,7 @@ type Evaluation struct {
 	CreateIndex uint64
 	ModifyIndex uint64
 
+	// Creation and modification times stored as UnixNano
 	CreateTime int64
 	ModifyTime int64
 }

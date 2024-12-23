@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/go-jose/go-jose/v3/jwt"
+	wrapping "github.com/hashicorp/go-kms-wrapping/v2"
 	msgpackrpc "github.com/hashicorp/net-rpc-msgpackrpc/v2"
 	"github.com/hashicorp/nomad/ci"
 	"github.com/hashicorp/nomad/helper/pointer"
@@ -118,6 +119,67 @@ func TestEncrypter_LoadSave(t *testing.T) {
 		must.Greater(t, 0, len(gotKey.RSAKey))
 	})
 
+}
+
+// TestEncrypter_loadKeyFromStore_emptyRSA tests a panic seen by some
+// operators where the aead key disk file content had an empty RSA block.
+func TestEncrypter_loadKeyFromStore_emptyRSA(t *testing.T) {
+	ci.Parallel(t)
+
+	srv := &Server{
+		logger: testlog.HCLogger(t),
+		config: &Config{},
+	}
+
+	tmpDir := t.TempDir()
+
+	key, err := structs.NewUnwrappedRootKey(structs.EncryptionAlgorithmAES256GCM)
+	must.NoError(t, err)
+
+	encrypter, err := NewEncrypter(srv, tmpDir)
+	must.NoError(t, err)
+
+	wrappedKey, err := encrypter.encryptDEK(key, &structs.KEKProviderConfig{})
+	must.NotNil(t, wrappedKey)
+	must.NoError(t, err)
+
+	// Use an artisanally crafted key file.
+	kek, err := json.Marshal(wrappedKey.KeyEncryptionKey)
+	must.NoError(t, err)
+
+	wrappedDEKCipher, err := json.Marshal(wrappedKey.WrappedDataEncryptionKey.Ciphertext)
+	must.NoError(t, err)
+
+	testData := fmt.Sprintf(`
+	{
+	 "Meta": {
+	   "KeyID": %q,
+	   "Algorithm": "aes256-gcm",
+	   "CreateTime": 1730000000000000000,
+	   "CreateIndex": 1555555,
+	   "ModifyIndex": 1555555,
+	   "State": "active",
+	   "PublishTime": 0
+	 },
+	 "ProviderID": "aead",
+	 "WrappedDEK": {
+	   "ciphertext": %s,
+	   "key_info": {
+	     "key_id": %q
+	   }
+	 },
+	 "WrappedRSAKey": {},
+	 "KEK": %s
+	}
+	`, key.Meta.KeyID, wrappedDEKCipher, key.Meta.KeyID, kek)
+
+	path := filepath.Join(tmpDir, key.Meta.KeyID+".nks.json")
+	err = os.WriteFile(path, []byte(testData), 0o600)
+	must.NoError(t, err)
+
+	unwrappedKey, err := encrypter.loadKeyFromStore(path)
+	must.NoError(t, err)
+	must.NotNil(t, unwrappedKey)
 }
 
 // TestEncrypter_Restore exercises the entire reload of a keystore,
@@ -772,4 +834,43 @@ func TestEncrypter_TransitConfigFallback(t *testing.T) {
 
 	fallbackVaultConfig(providers[2], &config.VaultConfig{})
 	must.Eq(t, expect, providers[2].Config, must.Sprint("expected fallback to env"))
+}
+
+func TestEncrypter_decryptWrappedKeyTask(t *testing.T) {
+	ci.Parallel(t)
+
+	srv := &Server{
+		logger: testlog.HCLogger(t),
+		config: &Config{},
+	}
+
+	tmpDir := t.TempDir()
+
+	key, err := structs.NewUnwrappedRootKey(structs.EncryptionAlgorithmAES256GCM)
+	must.NoError(t, err)
+
+	encrypter, err := NewEncrypter(srv, tmpDir)
+	must.NoError(t, err)
+
+	wrappedKey, err := encrypter.encryptDEK(key, &structs.KEKProviderConfig{})
+	must.NotNil(t, wrappedKey)
+	must.NoError(t, err)
+
+	// Purposely empty the RSA key, but do not nil it, so we can test for a
+	// panic where the key doesn't contain the ciphertext.
+	wrappedKey.WrappedRSAKey = &wrapping.BlobInfo{}
+
+	provider, ok := encrypter.providerConfigs[string(structs.KEKProviderAEAD)]
+	must.True(t, ok)
+	must.NotNil(t, provider)
+
+	KMSWrapper, err := encrypter.newKMSWrapper(provider, key.Meta.KeyID, wrappedKey.KeyEncryptionKey)
+	must.NoError(t, err)
+	must.NotNil(t, KMSWrapper)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	err = encrypter.decryptWrappedKeyTask(ctx, cancel, KMSWrapper, provider, key.Meta, wrappedKey)
+	must.NoError(t, err)
 }

@@ -667,13 +667,9 @@ export default function () {
   );
 
   this.get(
-    '/volume/:id',
+    '/volume/csi/:id',
     withBlockingSupport(function ({ csiVolumes }, { params, queryParams }) {
-      if (!params.id.startsWith('csi/')) {
-        return new Response(404, {}, null);
-      }
-
-      const id = params.id.replace(/^csi\//, '');
+      const { id } = params;
       const volume = csiVolumes.all().models.find((volume) => {
         const volumeIsDefault =
           !volume.namespaceId || volume.namespaceId === 'default';
@@ -708,7 +704,12 @@ export default function () {
     return this.serialize(volume);
   });
 
-  this.get('/agent/members', function ({ agents, regions }) {
+  this.get('/agent/members', function ({ agents, regions }, req) {
+    const tokenPresent = req.requestHeaders['X-Nomad-Token'];
+    if (!tokenPresent) {
+      return new Response(403, {}, 'Forbidden');
+    }
+
     const firstRegion = regions.first();
     return {
       ServerRegion: firstRegion ? firstRegion.id : null,
